@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build
+        run: cargo build --release --locked
+
+      - name: package
+        id: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARBALL="ecapp-v${VERSION}-x86_64-linux.tar.gz"
+          mkdir -p dist
+          cp target/release/ecapp dist/
+          tar czf "dist/$TARBALL" -C dist ecapp
+          SHA256=$(sha256sum "dist/$TARBALL" | cut -d' ' -f1)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/${{ steps.package.outputs.tarball }}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+      - name: sync aur ecapp-bin
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -ex
+          VERSION="${{ steps.package.outputs.version }}"
+          SHA256="${{ steps.package.outputs.sha256 }}"
+
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+              IdentityFile ~/.ssh/aur_key
+              User aur
+              StrictHostKeyChecking accept-new
+          EOF
+
+          git clone ssh://aur@aur.archlinux.org/ecapp-bin.git /tmp/aur-bin
+          cd /tmp/aur-bin
+
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s/^sha256sums=('.*')/sha256sums=('$SHA256')/" PKGBUILD
+
+          cat > .SRCINFO <<SRCEOF
+          pkgbase = ecapp-bin
+          	pkgdesc = Terminal Translation Tool
+          	pkgver = $VERSION
+          	pkgrel = 1
+          	url = https://github.com/missercatos/ecapp
+          	arch = x86_64
+          	license = MIT
+          	depends = glibc
+          	source = https://github.com/missercatos/ecapp/releases/download/v$VERSION/ecapp-v$VERSION-x86_64-linux.tar.gz
+          	sha256sums = $SHA256
+
+          pkgname = ecapp-bin
+          SRCEOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "update to v${VERSION}"
+          git push

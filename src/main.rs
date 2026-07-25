@@ -701,26 +701,27 @@ fn vim_command_line() -> io::Result<String> {
                 }
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
-                modifiers: KeyModifiers::NONE,
+                modifiers: mods,
                 ..
             }) => {
-                cmd.push(c);
-                execute!(stdout, Print(c.to_string()))?;
-                stdout.flush()?;
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                cmd.clear();
-                execute!(
-                    stdout,
-                    MoveTo(1, rows.saturating_sub(1)),
-                    Clear(ClearType::UntilNewLine),
-                    Print(":"),
-                )?;
-                stdout.flush()?;
+                if c == 'u'
+                    && matches!(mods, KeyModifiers::CONTROL)
+                {
+                    cmd.clear();
+                    execute!(
+                        stdout,
+                        MoveTo(1, rows.saturating_sub(1)),
+                        Clear(ClearType::UntilNewLine),
+                        Print(":"),
+                    )?;
+                    stdout.flush()?;
+                } else if c.is_control() {
+                    // ignore other control characters
+                } else {
+                    cmd.push(c);
+                    execute!(stdout, Print(c.to_string()))?;
+                    stdout.flush()?;
+                }
             }
             _ => {}
         }
@@ -787,7 +788,11 @@ fn raw_translate_input(
     let mut stdout = io::stdout();
     let mut buffer = String::new();
     let mut colon_pending = false;
-    let prompt_len = source.len() + target.len() + 17;
+    let prompt_len = if is_dict_mode {
+        source.len() + target.len() + 13
+    } else {
+        source.len() + target.len() + 18
+    };
 
     loop {
         let ev = event::read()?;
@@ -848,7 +853,12 @@ fn raw_translate_input(
                 stdout.flush()?;
                 continue;
             }
-            (KeyModifiers::NONE, c) => {
+            _ => {
+                if mods == KeyModifiers::CONTROL {
+                    // already handled above
+                    continue;
+                }
+                let c = c;
                 if buffer.is_empty() && c == ':' && !colon_pending {
                     // First colon at start of input — invisible, pending state
                     colon_pending = true;
@@ -900,7 +910,6 @@ fn raw_translate_input(
                 execute!(stdout, Print(c.to_string()))?;
                 stdout.flush()?;
             }
-            _ => {}
         }
     }
 

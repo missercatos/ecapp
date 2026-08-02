@@ -661,6 +661,33 @@ fn move_to_bottom_and_clear() -> io::Result<u16> {
 
 // ── input display (wrap-aware) ────────────────────────────────────────
 
+/// How long to wait after an Enter for a possible paste continuation.
+/// Terminals without bracketed paste send \r (Enter) for pasted newlines;
+/// a follow-up key within this window means the Enter was part of a paste.
+const PASTE_PEEK_MS: u64 = 40;
+
+fn read_event_timeout(d: Duration) -> io::Result<Option<Event>> {
+    if event::poll(d)? {
+        Ok(Some(event::read()?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// A key event that suggests the preceding Enter was a pasted newline
+/// rather than a real submit key press.
+fn is_paste_followup(k: &KeyEvent) -> bool {
+    matches!(
+        k.code,
+        KeyCode::Char(c)
+            if !c.is_control()
+                && !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT)
+    ) || (k.code == KeyCode::Enter && k.modifiers == KeyModifiers::NONE)
+        || k.code == KeyCode::Backspace
+        || (k.code == KeyCode::Char('j') && k.modifiers == KeyModifiers::CONTROL)
+}
+
 /// Tracks where the cursor is inside an input block so that redraws are
 /// correct even when the text wraps across multiple terminal rows, contains
 /// newlines, or the screen has scrolled.
@@ -768,10 +795,14 @@ fn vim_command_line() -> io::Result<String> {
     let mut canvas = InputCanvas::new();
     let mut cmd = String::new();
     let mut submitted = false;
+    let mut pending: Option<Event> = None;
     canvas.emit(&mut stdout, ":")?;
 
     loop {
-        let ev = event::read()?;
+        let ev = match pending.take() {
+            Some(e) => e,
+            None => event::read()?,
+        };
         match ev {
             Event::Paste(data) => {
                 let norm = data.replace("\r\n", "\n").replace('\r', "\n");
@@ -783,6 +814,24 @@ fn vim_command_line() -> io::Result<String> {
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => {
+                if let Some(next) = read_event_timeout(Duration::from_millis(PASTE_PEEK_MS))? {
+                    let is_paste = matches!(&next, Event::Key(k) if is_paste_followup(k));
+                    if is_paste {
+                        cmd.push('\n');
+                        canvas.redraw(&mut stdout, ":", &cmd)?;
+                        if !matches!(
+                            &next,
+                            Event::Key(k)
+                                if k.code == KeyCode::Char('j')
+                                    && k.modifiers == KeyModifiers::CONTROL
+                        ) {
+                            pending = Some(next);
+                        }
+                        continue;
+                    }
+                    // Not a paste follow-up: submit. The peeked event is
+                    // dropped because we are leaving the input loop.
+                }
                 execute!(stdout, Print("\r\n"))?;
                 submitted = true;
                 break;
@@ -892,9 +941,13 @@ fn raw_translate_input(
 
     let mut buffer = String::new();
     let mut colon_pending = false;
+    let mut pending: Option<Event> = None;
 
     loop {
-        let ev = event::read()?;
+        let ev = match pending.take() {
+            Some(e) => e,
+            None => event::read()?,
+        };
         match ev {
             Event::Paste(data) => {
                 let norm = data.replace("\r\n", "\n").replace('\r', "\n");
@@ -906,6 +959,30 @@ fn raw_translate_input(
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => {
+                // Without bracketed paste, terminals send \r (Enter) for
+                // pasted newlines. If another key follows within the peek
+                // window, this Enter belongs to a paste: insert a newline
+                // instead of submitting.
+                if let Some(next) = read_event_timeout(Duration::from_millis(PASTE_PEEK_MS))? {
+                    let is_paste = matches!(&next, Event::Key(k) if is_paste_followup(k));
+                    if is_paste {
+                        buffer.push('\n');
+                        canvas.emit(&mut stdout, "\n")?;
+                        // \r\n paste pairs: swallow the \n so we don't
+                        // insert two newlines for one line break.
+                        if !matches!(
+                            &next,
+                            Event::Key(k)
+                                if k.code == KeyCode::Char('j')
+                                    && k.modifiers == KeyModifiers::CONTROL
+                        ) {
+                            pending = Some(next);
+                        }
+                        continue;
+                    }
+                    // Not a paste follow-up: submit. The peeked event is
+                    // dropped because we are leaving the input loop.
+                }
                 execute!(stdout, Print("\r\n"))?;
                 stdout.flush()?;
                 break;

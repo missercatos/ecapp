@@ -1,6 +1,8 @@
 use crossterm::{
-    cursor::{MoveTo, MoveToColumn, RestorePosition, SavePosition},
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    cursor::{MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     style::Print,
     terminal::{self, Clear, ClearType},
@@ -11,6 +13,7 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 use ureq::Agent;
 
 // ── help ──────────────────────────────────────────────────────────────
@@ -45,7 +48,10 @@ Translate Mode Commands:
 
 Keyboard Shortcuts:
   Ctrl+U                  Clear the current input line
+  Ctrl+J                  Insert a newline (multi-line input)
   Ctrl+C                  Interrupt / cancel
+
+  Multi-line text — typed with Ctrl+J or pasted — is translated as one block.
 
 Language codes use Arch-style format: lowercase with underscore
 (e.g., en_us, zh_cn, ja_jp, fr_fr, de_de, es_es, pt_br, ru_ru).
@@ -608,13 +614,21 @@ fn show_tip() {
 
 // ── prompt helpers ────────────────────────────────────────────────────
 
+fn prompt_text(source: &str, target: &str, is_dict_mode: bool) -> String {
+    if is_dict_mode {
+        format!("\x1b[1;35m[Dict:\x1b[0m {source} \x1b[1;35m->\x1b[0m {target}\x1b[1;35m]\x1b[0m ")
+    } else {
+        format!("\x1b[1;34m[Translate:\x1b[0m {source} \x1b[1;34m->\x1b[0m {target}\x1b[1;34m]\x1b[0m ")
+    }
+}
+
 fn print_prompt(src: &str, tgt: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
     execute!(
         stdout,
         MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(format!("\x1b[1;34m[Translate:\x1b[0m {src} \x1b[1;34m->\x1b[0m {tgt}\x1b[1;34m]\x1b[0m ")),
+        Print(prompt_text(src, tgt, false)),
     )?;
     stdout.flush()?;
     Ok(())
@@ -626,7 +640,7 @@ fn print_prompt_dict(src: &str, tgt: &str) -> io::Result<()> {
         stdout,
         MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(format!("\x1b[1;35m[Dict:\x1b[0m {src} \x1b[1;35m->\x1b[0m {tgt}\x1b[1;35m]\x1b[0m ")),
+        Print(prompt_text(src, tgt, true)),
     )?;
     stdout.flush()?;
     Ok(())
@@ -645,37 +659,132 @@ fn move_to_bottom_and_clear() -> io::Result<u16> {
     Ok(rows)
 }
 
-fn restore_after_cmd(rows: u16) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveTo(0, rows.saturating_sub(1)),
-        Clear(ClearType::CurrentLine),
-        RestorePosition,
-    )?;
-    stdout.flush()?;
-    Ok(())
+// ── input display (wrap-aware) ────────────────────────────────────────
+
+/// Tracks where the cursor is inside an input block so that redraws are
+/// correct even when the text wraps across multiple terminal rows, contains
+/// newlines, or the screen has scrolled.
+struct InputCanvas {
+    term_width: usize,
+    cur_col: usize,
+    rows_used: usize,
+}
+
+impl InputCanvas {
+    fn new() -> Self {
+        let (w, _) = terminal::size().unwrap_or((80, 24));
+        Self {
+            term_width: usize::from(w.max(1)),
+            cur_col: 0,
+            rows_used: 1,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cur_col = 0;
+        self.rows_used = 1;
+    }
+
+    /// Print text, keeping the tracked cursor position in sync with what the
+    /// terminal really displays. ANSI CSI sequences count as zero width;
+    /// newlines move to the next row; a filled row is wrapped explicitly so
+    /// the real cursor never disagrees with the accounting.
+    fn emit(&mut self, stdout: &mut impl Write, text: &str) -> io::Result<()> {
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                out.push(c);
+                if chars.peek() == Some(&'[') {
+                    out.push(chars.next().unwrap());
+                    for n in chars.by_ref() {
+                        out.push(n);
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c == '\n' {
+                out.push_str("\r\n");
+                self.cur_col = 0;
+                self.rows_used += 1;
+                continue;
+            }
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if self.cur_col + w > self.term_width {
+                out.push_str("\r\n");
+                self.rows_used += 1;
+                self.cur_col = 0;
+            }
+            out.push(c);
+            self.cur_col += w;
+            if self.cur_col >= self.term_width {
+                out.push_str("\r\n");
+                self.rows_used += 1;
+                self.cur_col = 0;
+            }
+        }
+        stdout.write_all(out.as_bytes())?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Clear the whole input block and reprint prompt + buffer from its first
+    /// row. Uses only relative cursor movement (the tracked row count), so it
+    /// stays correct across wrapping, newlines and screen scrolling.
+    fn redraw(&mut self, stdout: &mut impl Write, prompt: &str, buffer: &str) -> io::Result<()> {
+        let up = self.rows_used.saturating_sub(1);
+        if up > 0 {
+            execute!(stdout, MoveUp(up as u16))?;
+        }
+        execute!(
+            stdout,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            Clear(ClearType::FromCursorDown),
+        )?;
+        self.reset();
+        self.emit(stdout, prompt)?;
+        self.emit(stdout, buffer)?;
+        Ok(())
+    }
+
+    /// Start a fresh input line: clear the current row and print the prompt.
+    fn begin(&mut self, stdout: &mut impl Write, prompt: &str) -> io::Result<()> {
+        execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        self.reset();
+        self.emit(stdout, prompt)
+    }
 }
 
 // ── vim-style bottom command line ─────────────────────────────────────
 
 fn vim_command_line() -> io::Result<String> {
-    let rows = move_to_bottom_and_clear()?;
+    let _ = move_to_bottom_and_clear()?;
 
     let mut stdout = io::stdout();
-    execute!(stdout, Print(":"))?;
-    stdout.flush()?;
-
+    let mut canvas = InputCanvas::new();
     let mut cmd = String::new();
+    let mut submitted = false;
+    canvas.emit(&mut stdout, ":")?;
+
     loop {
         let ev = event::read()?;
         match ev {
+            Event::Paste(data) => {
+                let norm = data.replace("\r\n", "\n").replace('\r', "\n");
+                cmd.push_str(&norm);
+                canvas.redraw(&mut stdout, ":", &cmd)?;
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => {
                 execute!(stdout, Print("\r\n"))?;
+                submitted = true;
                 break;
             }
             Event::Key(KeyEvent {
@@ -687,47 +796,44 @@ fn vim_command_line() -> io::Result<String> {
             Event::Key(KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            })
-                if !cmd.is_empty() => {
-                    cmd.pop();
-                    execute!(
-                        stdout,
-                        MoveTo(1, rows.saturating_sub(1)),
-                        Clear(ClearType::UntilNewLine),
-                        Print(":"),
-                        Print(&cmd),
-                    )?;
-                    stdout.flush()?;
-                }
+            }) if !cmd.is_empty() => {
+                cmd.pop();
+                canvas.redraw(&mut stdout, ":", &cmd)?;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                cmd.clear();
+                canvas.redraw(&mut stdout, ":", &cmd)?;
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: mods,
                 ..
-            }) => {
-                if c == 'u'
-                    && matches!(mods, KeyModifiers::CONTROL)
-                {
-                    cmd.clear();
-                    execute!(
-                        stdout,
-                        MoveTo(1, rows.saturating_sub(1)),
-                        Clear(ClearType::UntilNewLine),
-                        Print(":"),
-                    )?;
-                    stdout.flush()?;
-                } else if c.is_control() {
-                    // ignore other control characters
-                } else {
-                    cmd.push(c);
-                    execute!(stdout, Print(c.to_string()))?;
-                    stdout.flush()?;
-                }
+            }) if !c.is_control()
+                && !mods.contains(KeyModifiers::CONTROL)
+                && !mods.contains(KeyModifiers::ALT) =>
+            {
+                cmd.push(c);
+                canvas.emit(&mut stdout, &c.to_string())?;
             }
             _ => {}
         }
     }
 
-    restore_after_cmd(rows)?;
+    let up = (canvas.rows_used.saturating_sub(1) + usize::from(submitted)) as u16;
+    if up > 0 {
+        execute!(stdout, MoveUp(up))?;
+    }
+    execute!(
+        stdout,
+        Clear(ClearType::CurrentLine),
+        Clear(ClearType::FromCursorDown),
+        RestorePosition,
+    )?;
+    stdout.flush()?;
     Ok(cmd)
 }
 
@@ -779,86 +885,87 @@ fn raw_translate_input(
     target: &str,
     is_dict_mode: bool,
 ) -> io::Result<Option<String>> {
-    if is_dict_mode {
-        print_prompt_dict(source, target)?;
-    } else {
-        print_prompt(source, target)?;
-    }
-
     let mut stdout = io::stdout();
+    let prompt = prompt_text(source, target, is_dict_mode);
+    let mut canvas = InputCanvas::new();
+    canvas.begin(&mut stdout, &prompt)?;
+
     let mut buffer = String::new();
     let mut colon_pending = false;
-    let prompt_len = if is_dict_mode {
-        source.len() + target.len() + 13
-    } else {
-        source.len() + target.len() + 18
-    };
 
     loop {
         let ev = event::read()?;
-        let (c, mods) = match ev {
-            Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: m, .. }) => (c, m),
-            Event::Key(KeyEvent { code, modifiers, .. }) => {
-                match (code, modifiers) {
-                    (KeyCode::Enter, KeyModifiers::NONE) => {
-                        execute!(stdout, Print("\r\n"))?;
-                        stdout.flush()?;
-                        break;
-                    }
-                    (KeyCode::Backspace, _) => {
-                        if colon_pending {
-                            colon_pending = false;
-                            continue;
-                        }
-                        if !buffer.is_empty() {
-                            buffer.pop();
-                            execute!(
-                                stdout,
-                                MoveToColumn(prompt_len as u16),
-                                Clear(ClearType::UntilNewLine),
-                                Print(&buffer),
-                            )?;
-                            stdout.flush()?;
-                        }
-                        continue;
-                    }
-                    (KeyCode::Esc, _) => {
-                        buffer.clear();
-                        return Ok(None);
-                    }
-                    _ => continue,
+        match ev {
+            Event::Paste(data) => {
+                let norm = data.replace("\r\n", "\n").replace('\r', "\n");
+                buffer.push_str(&norm);
+                canvas.redraw(&mut stdout, &prompt, &buffer)?;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
+                execute!(stdout, Print("\r\n"))?;
+                stdout.flush()?;
+                break;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if colon_pending {
+                    colon_pending = false;
+                    continue;
+                }
+                if !buffer.is_empty() {
+                    buffer.pop();
+                    canvas.redraw(&mut stdout, &prompt, &buffer)?;
                 }
             }
-            _ => continue,
-        };
-
-        match (mods, c) {
-            (KeyModifiers::CONTROL, 'c') => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                buffer.clear();
+                return Ok(None);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                // Ctrl+J — newline inside the input
+                buffer.push('\n');
+                canvas.emit(&mut stdout, "\n")?;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 buffer.clear();
                 execute!(stdout, Print("^C\r\n"))?;
                 stdout.flush()?;
                 return Ok(None);
             }
-            (KeyModifiers::CONTROL, 'u') => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
                 // Ctrl+U: clear line
-                if colon_pending {
-                    colon_pending = false;
-                }
+                colon_pending = false;
                 buffer.clear();
-                execute!(
-                    stdout,
-                    MoveToColumn(prompt_len as u16),
-                    Clear(ClearType::UntilNewLine),
-                )?;
-                stdout.flush()?;
-                continue;
+                canvas.redraw(&mut stdout, &prompt, &buffer)?;
             }
-            _ => {
-                if mods == KeyModifiers::CONTROL {
-                    // already handled above
-                    continue;
-                }
-                let c = c;
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: mods,
+                ..
+            }) if !c.is_control()
+                && !mods.contains(KeyModifiers::CONTROL)
+                && !mods.contains(KeyModifiers::ALT) =>
+            {
                 if buffer.is_empty() && c == ':' && !colon_pending {
                     // First colon at start of input — invisible, pending state
                     colon_pending = true;
@@ -868,9 +975,7 @@ fn raw_translate_input(
                     // :/ — enter vim command line
                     execute!(stdout, Print("\r\n"))?;
                     stdout.flush()?;
-                    terminal::disable_raw_mode()?;
                     let cmd = vim_command_line()?;
-                    terminal::enable_raw_mode()?;
 
                     let cmd = format!("/{cmd}");
                     if !cmd.is_empty() && cmd != "/" {
@@ -884,32 +989,27 @@ fn raw_translate_input(
                     // empty or just "/": redraw prompt
                     buffer.clear();
                     colon_pending = false;
-                    if is_dict_mode {
-                        print_prompt_dict(source, target)?;
-                    } else {
-                        print_prompt(source, target)?;
-                    }
+                    canvas.begin(&mut stdout, &prompt)?;
                     continue;
                 }
                 if colon_pending && c == ':' {
                     // :: — treat as literal :
                     buffer.push(':');
                     buffer.push(':');
-                    print!("::");
-                    stdout.flush()?;
+                    canvas.emit(&mut stdout, "::")?;
                     colon_pending = false;
                     continue;
                 }
                 if colon_pending {
                     // colon followed by regular char — both are literal
                     buffer.push(':');
-                    print!(":");
+                    canvas.emit(&mut stdout, ":")?;
                     colon_pending = false;
                 }
                 buffer.push(c);
-                execute!(stdout, Print(c.to_string()))?;
-                stdout.flush()?;
+                canvas.emit(&mut stdout, &c.to_string())?;
             }
+            _ => {}
         }
     }
 
@@ -1163,9 +1263,11 @@ fn main() {
                 let is_tty = io::stdin().is_terminal();
                 if is_tty {
                     let _ = terminal::enable_raw_mode();
+                    let _ = execute!(io::stdout(), EnableBracketedPaste);
                 }
                 let result = translate_input(&src, &tgt, is_dict);
                 if is_tty {
+                    let _ = execute!(io::stdout(), DisableBracketedPaste);
                     let _ = terminal::disable_raw_mode();
                 }
 
@@ -1361,6 +1463,7 @@ fn main() {
         }
     }
 
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = terminal::disable_raw_mode();
 }
 

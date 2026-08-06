@@ -1,7 +1,7 @@
 # Maintainer: missercatos <missercatos@gmail.com>
 
 pkgname=ecapp-bin
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Terminal Translation Tool"
 arch=('x86_64')

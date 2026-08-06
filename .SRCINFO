@@ -1,6 +1,6 @@
 pkgbase = ecapp-bin
 	pkgdesc = Terminal Translation Tool
-	pkgver = 0.1.2
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/missercatos/ecapp
 	arch = x86_64

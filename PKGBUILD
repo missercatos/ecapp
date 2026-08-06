@@ -9,7 +9,7 @@ url="https://github.com/missercatos/ecapp"
 license=('MIT')
 depends=('glibc')
 source=("https://github.com/missercatos/ecapp/releases/download/v$pkgver/ecapp-v$pkgver-x86_64-linux.tar.gz")
-sha256sums=('75dbfc4886c72680b43fe25741fcb946239220dcd85f0f02ee486a343b30234a')
+sha256sums=('c5b0b0c1d53218620cd46fa77bb2977def03739d2e495b34482163bca180763b')
 
 package() {
   install -Dm755 ecapp "$pkgdir/usr/bin/ecapp"

@@ -1,6 +1,6 @@
 # Maintainer: missercatos <missercatos@gmail.com>
 
-pkgname=ecapp-bin
+pkgname=ecapp
 pkgver=0.2.0
 pkgrel=1
 pkgdesc="Terminal Translation Tool"

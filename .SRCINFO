@@ -1,4 +1,4 @@
-pkgbase = ecapp-bin
+pkgbase = ecapp
 	pkgdesc = Terminal Translation Tool
 	pkgver = 0.2.0
 	pkgrel = 1

@@ -29,8 +29,9 @@ Main Mode Commands:
   tra /<src> ~ <tgt>      Enter translation mode directly
                           Example: tra /en_us ~ zh_cn
   tra-dir, td             Enter dictionary-enhanced translation mode
-                          Same as tra, but single-word lookups show
-                          dictionary entries with phonetics.
+                          Same as tra, but single words are translated
+                          in both directions and dictionary entries are
+                          shown with phonetics.
   exit                    Exit ecapp
 
 Translate Mode Commands:
@@ -44,7 +45,8 @@ Translate Mode Commands:
 
   Any other text is translated from source to target language.
   In dictionary mode (tra-dir), single words also show dictionary
-  definitions with phonetics and multiple meanings.
+  definitions with phonetics, and are translated in both directions:
+  input words in either language are recognized automatically.
 
 Keyboard Shortcuts:
   Ctrl+U                  Clear the current input line
@@ -526,12 +528,16 @@ fn lookup_dictionary(
     }
 }
 
-fn format_dictionary(entries: &[DictEntry]) -> String {
+fn format_dictionary(entries: &[DictEntry], lang_code: &str) -> String {
     let mut out = String::new();
 
     for entry in entries {
         use std::fmt::Write;
-        let _ = writeln!(out, "\x1b[1;33m{}\x1b[0m", entry.word);
+        let _ = writeln!(
+            out,
+            "{}  \x1b[90m[{lang_code}]\x1b[0m",
+            entry.word
+        );
 
         let phonetics: Vec<&str> = entry
             .phonetics
@@ -587,6 +593,167 @@ fn format_dictionary(entries: &[DictEntry]) -> String {
 fn is_single_word(text: &str) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty() && !trimmed.contains(' ')
+}
+
+// ── bilingual dictionary (two-way) ───────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WordSide {
+    Source,
+    Target,
+}
+
+/// Classify a character as belonging to a major non-Latin script.
+fn char_script(c: char) -> Option<&'static str> {
+    match c as u32 {
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff => Some("cjk"),
+        0x3040..=0x30ff => Some("kana"),
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af => Some("hangul"),
+        0x0e00..=0x0e7f => Some("thai"),
+        0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff => Some("arabic"),
+        0x0590..=0x05ff => Some("hebrew"),
+        0x0400..=0x052f => Some("cyrillic"),
+        0x0370..=0x03ff | 0x1f00..=0x1fff => Some("greek"),
+        0x0900..=0x097f => Some("devanagari"),
+        0x0980..=0x09ff => Some("bengali"),
+        0x0a00..=0x0a7f => Some("gurmukhi"),
+        0x0a80..=0x0aff => Some("gujarati"),
+        0x0b00..=0x0b7f => Some("oriya"),
+        0x0b80..=0x0bff => Some("tamil"),
+        0x0c00..=0x0c7f => Some("telugu"),
+        0x0c80..=0x0cff => Some("kannada"),
+        0x0d00..=0x0d7f => Some("malayalam"),
+        0x0d80..=0x0dff => Some("sinhala"),
+        0x10a0..=0x10ff => Some("georgian"),
+        0x0530..=0x058f => Some("armenian"),
+        0x1200..=0x137f | 0x2d80..=0x2ddf => Some("ethiopic"),
+        0x0e80..=0x0eff => Some("lao"),
+        0x1780..=0x17ff => Some("khmer"),
+        0x1000..=0x109f => Some("myanmar"),
+        0x1800..=0x18af => Some("mongolian"),
+        _ => None,
+    }
+}
+
+/// The non-Latin scripts used to write a given language code.
+/// Languages not listed here are written in the Latin script.
+fn lang_scripts(code: &str) -> Vec<&'static str> {
+    let lang = code.split('_').next().unwrap_or(code);
+    match lang {
+        "zh" => vec!["cjk"],
+        "ja" => vec!["kana", "cjk"],
+        "ko" => vec!["hangul"],
+        "th" => vec!["thai"],
+        "lo" => vec!["lao"],
+        "km" => vec!["khmer"],
+        "my" => vec!["myanmar"],
+        "mn" => vec!["mongolian", "cyrillic"],
+        "ar" | "fa" | "ur" | "ps" | "sd" => vec!["arabic"],
+        "he" | "yi" => vec!["hebrew"],
+        "ru" | "uk" | "be" | "bg" | "sr" | "mk" | "kk" | "ky" | "tg" | "uz" => {
+            vec!["cyrillic"]
+        }
+        "el" => vec!["greek"],
+        "hi" | "mr" | "ne" => vec!["devanagari"],
+        "bn" => vec!["bengali"],
+        "pa" => vec!["gurmukhi"],
+        "gu" => vec!["gujarati"],
+        "or" => vec!["oriya"],
+        "ta" => vec!["tamil"],
+        "te" => vec!["telugu"],
+        "kn" => vec!["kannada"],
+        "ml" => vec!["malayalam"],
+        "si" => vec!["sinhala"],
+        "ka" => vec!["georgian"],
+        "hy" => vec!["armenian"],
+        "am" => vec!["ethiopic"],
+        _ => vec![],
+    }
+}
+
+/// Decide whether a single word is written in the source or the target
+/// language, based on the script of its characters.  Words written in
+/// only the Latin script are attributed to a Latin-script language; if
+/// both languages use Latin, the source side wins.
+fn detect_side(word: &str, src: &str, tgt: &str) -> WordSide {
+    let src_scripts = lang_scripts(src);
+    let tgt_scripts = lang_scripts(tgt);
+    let mut src_hits = 0usize;
+    let mut tgt_hits = 0usize;
+    let mut non_latin = 0usize;
+    for c in word.chars() {
+        if let Some(sc) = char_script(c) {
+            non_latin += 1;
+            if src_scripts.contains(&sc) {
+                src_hits += 1;
+            }
+            if tgt_scripts.contains(&sc) {
+                tgt_hits += 1;
+            }
+        }
+    }
+    if tgt_hits > src_hits {
+        return WordSide::Target;
+    }
+    if src_hits > tgt_hits {
+        return WordSide::Source;
+    }
+    if non_latin == 0 {
+        // Pure Latin input: attribute it to the Latin-script side,
+        // if exactly one of the two languages uses Latin.
+        if !src_scripts.is_empty() && tgt_scripts.is_empty() {
+            return WordSide::Target;
+        }
+    }
+    WordSide::Source
+}
+
+/// Dictionary-enhanced lookup of a single word: shows the dictionary
+/// entry for the side the word belongs to, then translates it into the
+/// other language, and shows that side's dictionary entry too when the
+/// translation is itself a single word.
+fn handle_dict_word(
+    agent: &Agent,
+    config: &ApiConfig,
+    word: &str,
+    src: &str,
+    tgt: &str,
+) {
+    println!();
+    let word = word.trim();
+    let (dict_lang, other_lang) = match detect_side(word, src, tgt) {
+        WordSide::Source => (src, tgt),
+        WordSide::Target => (tgt, src),
+    };
+
+    let mut dict_hit = false;
+    match lookup_dictionary(agent, word, dict_lang) {
+        Ok(entries) => {
+            dict_hit = true;
+            println!("{}", format_dictionary(&entries, dict_lang));
+        }
+        Err(_) => println!("\x1b[1m{word}\x1b[0m"),
+    }
+
+    match translate_dispatch(agent, config, word, dict_lang, other_lang) {
+        Ok(translated) => {
+            let t = translated.trim();
+            if !t.is_empty() && !t.eq_ignore_ascii_case(word) {
+                println!("  \x1b[1;32m{t}\x1b[0m  \x1b[90m[{other_lang}]\x1b[0m");
+                if is_single_word(t)
+                    && let Ok(entries) = lookup_dictionary(agent, t, other_lang)
+                {
+                    println!("{}", format_dictionary(&entries, other_lang));
+                }
+            }
+        }
+        Err(e) => {
+            if !dict_hit {
+                eprintln!("Translation failed: {e}");
+            }
+        }
+    }
+    println!();
 }
 
 // ── tip display ───────────────────────────────────────────────────────
@@ -1284,9 +1451,8 @@ fn main() {
                             continue;
                         };
                         println!("\nDict mode ready: {source} -> {target}");
-                        println!(
-                            "Single words → dictionary (with phonetics & definitions)."
-                        );
+                        println!("Single words → bilingual dictionary + mutual translation");
+                        println!("(either language works; direction auto-detected).");
                         println!("Sentences → normal translation. :/exit to leave.\n");
                         mode = AppMode::Translate { source, target, dict: true };
                     }
@@ -1312,7 +1478,8 @@ fn main() {
                                 }
                                 if is_dict {
                                     println!("Dict mode ready: {src} -> {tgt}");
-                                    println!("Single words → dictionary. Sentences → translation.\n");
+                                    println!("Single words → bilingual dictionary + mutual translation.");
+                                    println!("Sentences → normal translation.\n");
                                 } else {
                                     println!("Translation ready: {src} -> {tgt}");
                                     println!("Enter text to translate.\n");
@@ -1419,20 +1586,7 @@ fn main() {
                         }
 
                         if is_dict && is_single_word(&input) {
-                            println!();
-                            let trimmed = input.trim();
-                            match lookup_dictionary(&agent, trimmed, &src) {
-                                Ok(entries) => {
-                                    let formatted = format_dictionary(&entries);
-                                    println!("{formatted}");
-                                }
-                                Err(_e) => {
-                                    match translate_dispatch(&agent, &config, trimmed, &src, &tgt) {
-                                        Ok(t) => println!("\x1b[32m{t}\x1b[0m\n"),
-                                        Err(e) => eprintln!("Translation failed: {e}\n"),
-                                    }
-                                }
-                            }
+                            handle_dict_word(&agent, &config, &input, &src, &tgt);
                         } else {
                             match translate_dispatch(&agent, &config, &input, &src, &tgt) {
                                 Ok(translated) => println!("\x1b[32m{translated}\x1b[0m\n"),
@@ -1549,5 +1703,39 @@ fn mask_key(key: &str) -> String {
         "***".into()
     } else {
         format!("{}...{}", &key[..4], &key[key.len()-4..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_cjk_words() {
+        assert_eq!(detect_side("苹果", "en_us", "zh_cn"), WordSide::Target);
+        assert_eq!(detect_side("苹果", "zh_cn", "en_us"), WordSide::Source);
+        assert_eq!(detect_side("语言", "zh_cn", "ja_jp"), WordSide::Source);
+    }
+
+    #[test]
+    fn detect_kana_words() {
+        assert_eq!(detect_side("りんご", "zh_cn", "ja_jp"), WordSide::Target);
+        assert_eq!(detect_side("りんご", "ja_jp", "zh_cn"), WordSide::Source);
+    }
+
+    #[test]
+    fn detect_latin_words() {
+        assert_eq!(detect_side("apple", "en_us", "zh_cn"), WordSide::Source);
+        assert_eq!(detect_side("apple", "zh_cn", "en_us"), WordSide::Target);
+        assert_eq!(detect_side("pomme", "fr_fr", "zh_cn"), WordSide::Source);
+        assert_eq!(detect_side("livro", "pt_br", "de_de"), WordSide::Source);
+    }
+
+    #[test]
+    fn detect_hangul_and_thai() {
+        assert_eq!(detect_side("사과", "ko_kr", "en_us"), WordSide::Source);
+        assert_eq!(detect_side("사과", "en_us", "ko_kr"), WordSide::Target);
+        assert_eq!(detect_side("แอปเปิล", "th_th", "en_us"), WordSide::Source);
+        assert_eq!(detect_side("แอปเปิล", "en_us", "th_th"), WordSide::Target);
     }
 }

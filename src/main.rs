@@ -1961,6 +1961,56 @@ fn validate_lang_pair(source: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Split long text into chunks that fit the backend's per-request limit
+/// (MyMemory: 500 bytes). Breaks at newlines when possible.
+fn chunk_text(text: &str, limit_bytes: usize) -> Vec<String> {
+    if text.len() <= limit_bytes {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if cur.len() >= limit_bytes && c == '\n' {
+            chunks.push(std::mem::take(&mut cur));
+            continue;
+        }
+        if cur.len() + c.len_utf8() > limit_bytes {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Translate large one-shot inputs by splitting them into chunks that fit
+/// the backend's request limit, then joining the results.
+fn translate_text_chunked(
+    agent: &Agent,
+    config: &ApiConfig,
+    text: &str,
+    src: &str,
+    tgt: &str,
+) -> Result<String, String> {
+    let limit = if config.backend == "mymemory" { 450 } else { 15000 };
+    let chunks = chunk_text(text, limit);
+    if chunks.len() == 1 {
+        return translate_dispatch(agent, config, &chunks[0], src, tgt);
+    }
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let translated = translate_dispatch(agent, config, chunk, src, tgt)
+            .map_err(|e| format!("chunk {}/{}: {e}", i + 1, chunks.len()))?;
+        out.push_str(&translated);
+        if i + 1 < chunks.len() {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 fn run_cli_translate(
     agent: &Agent,
     config: &ApiConfig,
@@ -2032,11 +2082,17 @@ fn run_cli_translate(
         }
     };
 
-    match translate_dispatch(agent, config, &text, &src, &tgt) {
+    if text.trim().is_empty() {
+        eprintln!("Nothing to translate (empty input).");
+        std::process::exit(1);
+    }
+
+    let translated = translate_text_chunked(agent, config, &text, &src, &tgt);
+    match translated {
         Ok(translated) => {
             if let Some(out) = output {
                 match fs::write(&out, &translated) {
-                    Ok(()) => println!("Translation written to {}.", out.display()),
+                    Ok(()) => eprintln!("Translation written to {}.", out.display()),
                     Err(e) => {
                         eprintln!("cannot write '{}': {e}", out.display());
                         std::process::exit(1);

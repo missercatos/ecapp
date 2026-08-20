@@ -96,6 +96,18 @@ ecapp -t en_us zh_cn @english.txt -o chinese.txt
 man zip | ecapp -t en_us zh_cn
 journalctl | ecapp -t auto zh_cn
 
+# extract the important part with grep, then translate (grep | ecapp)
+grep -o "error" log.txt | ecapp -t auto zh_cn
+
+# translate a web page fetched with curl
+curl https://example.com | ecapp -t auto zh_cn
+
+# shell output redirection works natively: > writes the translation,
+# 2>&1 merges errors, and all of them can be mixed with pipes
+ecapp -t en_us zh_cn "Hello" > chinese.txt
+ecapp -t en_us zh_cn "@log.md" > chinese.txt 2>&1
+curl https://example.com | ecapp -t auto zh_cn > zh.html 2>&1
+
 # auto-detect the input language (only the source can be 'auto')
 ecapp -t auto zh_cn "Bonjour le monde"
 ecapp --set=auto->zh_cn
@@ -105,6 +117,21 @@ ecapp -p
 ecapp --performe
 ecapp -t zh_cn en_us -p
 ```
+
+### Pipes, redirection and large inputs
+
+- **`<cmd> | ecapp -t <src> <tgt>`** — ecapp reads the piped data from stdin and
+  prints the translation to stdout, so it can be mixed freely with other
+  commands: `grep | ecapp`, `cat | ecapp`, `curl <url> | ecapp`, ...
+- **`ecapp ... > file`** — output redirection works natively (the translation
+  is written as plain text, without terminal colors).
+- **`ecapp ... 2>&1`** — error messages and status messages go to stderr, so
+  `2>&1` captures everything in one stream. The translation itself only ever
+  goes to stdout.
+- **Large inputs are chunked automatically** — free APIs like MyMemory limit
+  each request to ~500 bytes; ecapp splits long files / piped output into
+  chunks, translates them in order, and joins the results. Translation of
+  whole log files or web pages works out of the box.
 
 > **Note:** when using the `--tra=src->tgt` / `--set=src->tgt` forms, quote the
 > whole argument — `ecapp '--tra=en_us->zh_cn' "Hello"`. Most shells treat the

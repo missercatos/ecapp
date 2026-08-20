@@ -22,6 +22,27 @@ const HELP_TEXT: &str = r#"
 ecapp — Terminal Translation Tool
 ==================================
 
+CLI Usage (one-shot, works without entering the interactive shell):
+  ecapp -h, --help                         Show this help
+  ecapp -t <src> <tgt> <text>              Translate text
+  ecapp --tra=<src>-><tgt> <text>          Same as -t (also --translation=...)
+  ecapp --tra <src> <tgt> <text>           Same (also --translation ...)
+  ecapp -t <text>                          Translate using default languages
+  ecapp -t <src> <tgt> @file               Translate a file (log/md/txt/...)
+  ecapp -t <src> <tgt> @file -o out.txt    Write the result to a file
+  <cmd> | ecapp -t <src> <tgt>             Translate another command's output
+                                           e.g. man zip | ecapp -t en_us zh_cn
+                                                journalctl | ecapp -t auto zh_cn
+  ecapp -s <src> <tgt>                     Set default languages
+  ecapp --set=<src>-><tgt>                 Same
+  ecapp -p, --performe, --per              Real-time translation mode
+  ecapp -t <src> <tgt> -p                  Performe mode with explicit languages
+
+  auto: the source language may be 'auto' (only as source) to detect the
+        input language automatically. Examples:
+          ecapp -t auto zh_cn "Hello"
+          ecapp --set=auto->zh_cn
+
 Main Mode Commands:
   help, h                 Show this help
   api                     Manage translation API backend and keys
@@ -32,6 +53,10 @@ Main Mode Commands:
                           Same as tra, but single words are translated
                           in both directions and dictionary entries are
                           shown with phonetics.
+  per, performe           Enter real-time translation mode
+                          (requires default languages, see 'set')
+  set <src> <tgt>         Set default languages ('auto' allowed as source)
+  set                     Show current default languages
   exit                    Exit ecapp
 
 Translate Mode Commands:
@@ -190,11 +215,20 @@ fn find_language(code: &str) -> Option<&Language> {
 struct ApiConfig {
     backend: String,
     api_key: Option<String>,
+    #[serde(default)]
+    default_source: Option<String>,
+    #[serde(default)]
+    default_target: Option<String>,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self { backend: "mymemory".into(), api_key: None }
+        Self {
+            backend: "mymemory".into(),
+            api_key: None,
+            default_source: None,
+            default_target: None,
+        }
     }
 }
 
@@ -270,12 +304,118 @@ struct MmData {
     translated_text: String,
 }
 
+fn mymemory_query(agent: &Agent, url: &str) -> Result<MmResponse, String> {
+    let resp = agent
+        .get(url)
+        .header("User-Agent", "ecapp/0.3")
+        .call()
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let mut body_bytes = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .read_to_end(&mut body_bytes)
+        .map_err(|e| format!("read error: {e}"))?;
+
+    serde_json::from_slice(&body_bytes).map_err(|e| format!("parse error: {e}"))
+}
+
+/// Map a detected script to a concrete language code.
+fn script_to_lang_code(sc: &str) -> Option<&'static str> {
+    Some(match sc {
+        "cjk" => "zh_cn",
+        "hangul" => "ko_kr",
+        "thai" => "th_th",
+        "arabic" => "ar_sa",
+        "hebrew" => "he_il",
+        "cyrillic" => "ru_ru",
+        "greek" => "el_gr",
+        "devanagari" => "hi_in",
+        "bengali" => "bn_in",
+        "gurmukhi" => "pa_in",
+        "gujarati" => "gu_in",
+        "oriya" => "or_in",
+        "tamil" => "ta_in",
+        "telugu" => "te_in",
+        "kannada" => "kn_in",
+        "malayalam" => "ml_in",
+        "sinhala" => "si_lk",
+        "georgian" => "ka_ge",
+        "armenian" => "hy_am",
+        "ethiopic" => "am_et",
+        "lao" => "lo_la",
+        "khmer" => "km_kh",
+        "myanmar" => "my_mm",
+        "mongolian" => "mn_mn",
+        _ => return None,
+    })
+}
+
+/// Local, script-based language detection for the 'auto' source language.
+/// Latin-only (undetectable) text is assumed to be English.
+fn detect_language_code(text: &str) -> &'static str {
+    let mut has_kana = false;
+    let mut counts: std::collections::HashMap<&'static str, usize> = Default::default();
+    for c in text.chars() {
+        match char_script(c) {
+            Some("kana") => has_kana = true,
+            Some(sc) => {
+                if let Some(lang) = script_to_lang_code(sc) {
+                    *counts.entry(lang).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_kana {
+        return "ja_jp";
+    }
+    if counts.is_empty() {
+        return "en_us";
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(l, _)| l)
+        .unwrap_or("en_us")
+}
+
+/// 'auto' source: detect the language locally, then query MyMemory with the
+/// explicit source language.
+fn translate_via_mymemory_auto(
+    agent: &Agent,
+    text: &str,
+    tgt: &Language,
+) -> Result<String, String> {
+    let detected = detect_language_code(text);
+    let src = find_language(detected).expect("detected language code is always valid");
+    if src.api_code.eq_ignore_ascii_case(tgt.api_code) {
+        return Ok(text.to_string());
+    }
+    let url = format!(
+        "https://api.mymemory.translated.net/get?q={}&langpair={}|{}",
+        url_encode(text),
+        src.api_code,
+        tgt.api_code,
+    );
+    let body = mymemory_query(agent, &url)?;
+    match body.response_status {
+        Some(200) | Some(202) | None => Ok(body.response_data.translated_text),
+        Some(s) => Err(format!("API error (status {s})")),
+    }
+}
+
 fn translate_via_mymemory(
     agent: &Agent,
     text: &str,
     source_code: &str,
     target_code: &str,
 ) -> Result<String, String> {
+    if source_code.eq_ignore_ascii_case("auto") {
+        let tgt = find_language(target_code)
+            .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
+        return translate_via_mymemory_auto(agent, text, tgt);
+    }
     let src = find_language(source_code)
         .ok_or_else(|| format!("unknown source language '{source_code}'"))?;
     let tgt = find_language(target_code)
@@ -288,20 +428,7 @@ fn translate_via_mymemory(
         tgt.api_code,
     );
 
-    let resp = agent
-        .get(&url)
-        .header("User-Agent", "ecapp/0.2")
-        .call()
-        .map_err(|e| format!("network error: {e}"))?;
-
-    let mut body_bytes = Vec::new();
-    resp.into_body()
-        .as_reader()
-        .read_to_end(&mut body_bytes)
-        .map_err(|e| format!("read error: {e}"))?;
-
-    let body: MmResponse =
-        serde_json::from_slice(&body_bytes).map_err(|e| format!("parse error: {e}"))?;
+    let body = mymemory_query(agent, &url)?;
 
     match body.response_status {
         Some(200) | Some(202) | None => Ok(body.response_data.translated_text),
@@ -316,17 +443,19 @@ fn translate_google(
     source_code: &str,
     target_code: &str,
 ) -> Result<String, String> {
-    let src = find_language(source_code)
-        .ok_or_else(|| format!("unknown source language '{source_code}'"))?;
     let tgt = find_language(target_code)
         .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "q": text,
-        "source": src.api_code,
         "target": tgt.api_code,
         "format": "text",
     });
+    if !source_code.eq_ignore_ascii_case("auto") {
+        let src = find_language(source_code)
+            .ok_or_else(|| format!("unknown source language '{source_code}'"))?;
+        body["source"] = serde_json::json!(src.api_code);
+    }
 
     let url = format!(
         "https://translation.googleapis.com/language/translate/v2?key={api_key}"
@@ -371,20 +500,23 @@ fn translate_deepl(
     source_code: &str,
     target_code: &str,
 ) -> Result<String, String> {
-    let src = find_language(source_code)
-        .ok_or_else(|| format!("unknown source language '{source_code}'"))?;
     let tgt = find_language(target_code)
         .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
 
-    let src_upper = src.api_code.to_uppercase();
     let tgt_upper = tgt.api_code.to_uppercase();
 
     let url = "https://api-free.deepl.com/v2/translate";
-    let params: Vec<(&str, &str)> = vec![
+    let mut params: Vec<(&str, &str)> = vec![
         ("text", text),
-        ("source_lang", &src_upper),
         ("target_lang", &tgt_upper),
     ];
+    let src_upper;
+    if !source_code.eq_ignore_ascii_case("auto") {
+        let src = find_language(source_code)
+            .ok_or_else(|| format!("unknown source language '{source_code}'"))?;
+        src_upper = src.api_code.to_uppercase();
+        params.push(("source_lang", &src_upper));
+    }
 
     let resp = agent
         .post(url)
@@ -421,6 +553,9 @@ fn translate_dispatch(
     source: &str,
     target: &str,
 ) -> Result<String, String> {
+    if target.eq_ignore_ascii_case("auto") {
+        return Err("'auto' can only be the source language".into());
+    }
     match config.backend.as_str() {
         "google" => {
             let key = config.api_key.as_deref().unwrap_or("");
@@ -502,7 +637,7 @@ fn lookup_dictionary(
 
     let resp = agent
         .get(&url)
-        .header("User-Agent", "ecapp/0.2")
+        .header("User-Agent", "ecapp/0.3")
         .call()
         .map_err(|e| {
             if e.to_string().contains("404") || e.to_string().contains("status 404") {
@@ -809,6 +944,45 @@ fn print_prompt_dict(src: &str, tgt: &str) -> io::Result<()> {
         Clear(ClearType::CurrentLine),
         Print(prompt_text(src, tgt, true)),
     )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn performe_prompt_text(source: &str, target: &str) -> String {
+    format!("\x1b[1;33m[Performe:\x1b[0m {source} \x1b[1;33m->\x1b[0m {target}\x1b[1;33m]\x1b[0m ")
+}
+
+fn truncate_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// Draw a one-line status bar at the bottom of the terminal and restore the
+/// cursor to where it was. Skipped when the input block reaches the bottom
+/// row (otherwise it would overwrite the input line).
+fn show_bottom_bar(text: &str, start_row: u16, rows_used: usize) -> io::Result<()> {
+    let (w, rows) = terminal::size().unwrap_or((80, 24));
+    if usize::from(start_row) + rows_used.saturating_sub(1) >= usize::from(rows) {
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        SavePosition,
+        MoveTo(0, rows.saturating_sub(1)),
+        Clear(ClearType::CurrentLine),
+    )?;
+    let shown = truncate_width(text, usize::from(w));
+    execute!(stdout, Print(shown), RestorePosition)?;
     stdout.flush()?;
     Ok(())
 }
@@ -1264,6 +1438,221 @@ fn raw_translate_input(
     }
 }
 
+// ── performe mode (real-time translation) ─────────────────────────────
+
+const PERF_DEBOUNCE_MS: u64 = 350;
+
+fn mark_perf_change(last_change: &mut std::time::Instant, pending: &mut bool) {
+    *last_change = std::time::Instant::now();
+    *pending = true;
+}
+
+/// Raw-mode input loop for performe mode: while typing, the translation of
+/// the current buffer is shown (debounced) at the bottom of the terminal.
+/// Enter commits the line (returns it), Esc / Ctrl+C exits.
+fn raw_performe_input(
+    agent: &Agent,
+    config: &ApiConfig,
+    source: &str,
+    target: &str,
+) -> io::Result<Option<String>> {
+    let mut stdout = io::stdout();
+    let prompt = performe_prompt_text(source, target);
+    let mut canvas = InputCanvas::new();
+    let start_row = crossterm::cursor::position()
+        .map(|(_, r)| r)
+        .unwrap_or(1);
+    canvas.begin(&mut stdout, &prompt)?;
+
+    let mut buffer = String::new();
+    let mut pending: Option<Event> = None;
+    let mut colon_pending = false;
+    let mut last_change = std::time::Instant::now();
+    let mut translate_pending = false;
+
+    loop {
+        let ev = match pending.take() {
+            Some(e) => e,
+            None => match read_event_timeout(Duration::from_millis(25))? {
+                Some(e) => e,
+                None => {
+                    if translate_pending
+                        && last_change.elapsed().as_millis() >= PERF_DEBOUNCE_MS as u128
+                    {
+                        translate_pending = false;
+                        let text = buffer.trim_end().to_string();
+                        if text.is_empty() {
+                            show_bottom_bar("", start_row, canvas.rows_used)?;
+                        } else {
+                            match translate_dispatch(agent, config, &text, source, target) {
+                                Ok(t) => {
+                                    show_bottom_bar(&t, start_row, canvas.rows_used)?
+                                }
+                                Err(e) => show_bottom_bar(
+                                    &format!("\x1b[1;31mTranslation failed: {e}\x1b[0m"),
+                                    start_row,
+                                    canvas.rows_used,
+                                )?,
+                            }
+                        }
+                    }
+                    continue;
+                }
+            },
+        };
+        match ev {
+            Event::Paste(data) => {
+                let norm = data.replace("\r\n", "\n").replace('\r', "\n");
+                buffer.push_str(&norm);
+                canvas.redraw(&mut stdout, &prompt, &buffer)?;
+                mark_perf_change(&mut last_change, &mut translate_pending);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
+                if let Some(next) = read_event_timeout(Duration::from_millis(PASTE_PEEK_MS))? {
+                    let is_paste = matches!(&next, Event::Key(k) if is_paste_followup(k));
+                    if is_paste {
+                        buffer.push('\n');
+                        canvas.emit(&mut stdout, "\n")?;
+                        if !matches!(
+                            &next,
+                            Event::Key(k)
+                                if k.code == KeyCode::Char('j')
+                                    && k.modifiers == KeyModifiers::CONTROL
+                        ) {
+                            pending = Some(next);
+                        }
+                        mark_perf_change(&mut last_change, &mut translate_pending);
+                        continue;
+                    }
+                }
+                show_bottom_bar("", start_row, canvas.rows_used)?;
+                execute!(stdout, Print("\r\n"))?;
+                stdout.flush()?;
+                return Ok(Some(buffer));
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if colon_pending {
+                    colon_pending = false;
+                    continue;
+                }
+                if !buffer.is_empty() {
+                    buffer.pop();
+                    canvas.redraw(&mut stdout, &prompt, &buffer)?;
+                    mark_perf_change(&mut last_change, &mut translate_pending);
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                show_bottom_bar("", start_row, canvas.rows_used)?;
+                return Ok(None);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                buffer.push('\n');
+                canvas.emit(&mut stdout, "\n")?;
+                mark_perf_change(&mut last_change, &mut translate_pending);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                buffer.clear();
+                show_bottom_bar("", start_row, canvas.rows_used)?;
+                execute!(stdout, Print("^C\r\n"))?;
+                stdout.flush()?;
+                return Ok(None);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                colon_pending = false;
+                buffer.clear();
+                canvas.redraw(&mut stdout, &prompt, &buffer)?;
+                mark_perf_change(&mut last_change, &mut translate_pending);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: mods,
+                ..
+            }) if !c.is_control()
+                && !mods.contains(KeyModifiers::CONTROL)
+                && !mods.contains(KeyModifiers::ALT) =>
+            {
+                if buffer.is_empty() && c == ':' && !colon_pending {
+                    colon_pending = true;
+                    continue;
+                }
+                if colon_pending && c == '/' {
+                    // :/ in performe mode — treat both chars literally
+                    buffer.push(':');
+                    buffer.push('/');
+                    canvas.emit(&mut stdout, ":/")?;
+                    colon_pending = false;
+                    mark_perf_change(&mut last_change, &mut translate_pending);
+                    continue;
+                }
+                if colon_pending {
+                    buffer.push(':');
+                    canvas.emit(&mut stdout, ":")?;
+                    colon_pending = false;
+                }
+                buffer.push(c);
+                canvas.emit(&mut stdout, &c.to_string())?;
+                mark_perf_change(&mut last_change, &mut translate_pending);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Performe mode driver: keeps re-entering the raw input loop until the user
+/// exits (Esc / Ctrl+C). Each committed line is translated and printed.
+fn run_performe_mode(agent: &Agent, config: &ApiConfig, source: &str, target: &str) {
+    println!(
+        "Real-time translation mode ({source} -> {target}). \
+         The translation follows your typing at the bottom of the screen.\n"
+    );
+    loop {
+        let is_tty = io::stdin().is_terminal();
+        if is_tty {
+            let _ = terminal::enable_raw_mode();
+            let _ = execute!(io::stdout(), EnableBracketedPaste);
+        }
+        let result = raw_performe_input(agent, config, source, target);
+        if is_tty {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+            let _ = terminal::disable_raw_mode();
+        }
+        match result {
+            Ok(Some(input)) => {
+                if input.is_empty() {
+                    continue;
+                }
+                match translate_dispatch(agent, config, &input, source, target) {
+                    Ok(translated) => println!("\x1b[32m{translated}\x1b[0m\n"),
+                    Err(e) => eprintln!("Translation failed: {e}\n"),
+                }
+            }
+            _ => break,
+        }
+    }
+    println!("Left performe mode.");
+}
+
 // ── command handler in translate mode ─────────────────────────────────
 
 enum CmdResult {
@@ -1385,13 +1774,291 @@ enum AppMode {
     ApiConfig,
 }
 
+// ── CLI one-shot mode ─────────────────────────────────────────────────
+
+enum CliAction {
+    Help,
+    Set { source: String, target: String },
+    Translate {
+        source: Option<String>,
+        target: Option<String>,
+        content: Option<String>,
+        output: Option<PathBuf>,
+        performe: bool,
+    },
+    Interactive,
+}
+
+/// Parse "<src>-><tgt>" (exactly one arrow).
+fn parse_arrow(s: &str) -> Option<(String, String)> {
+    let mut parts = s.split("->");
+    let src = parts.next()?.trim().to_lowercase();
+    let tgt = parts.next()?.trim().to_lowercase();
+    if src.is_empty() || tgt.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((src, tgt))
+}
+
+/// Split the positional arguments of -t/--tra into
+/// (source, target, content). A leading argument that is a valid language
+/// code (or 'auto') is treated as the source; the second one, if it is a
+/// valid code, as the target; everything else is content.
+fn resolve_t_langs(
+    args: &[String],
+    langs: Option<(String, String)>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some((s, t)) = langs {
+        let content = if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        };
+        return (Some(s), Some(t), content);
+    }
+    if args.is_empty() {
+        return (None, None, None);
+    }
+    let first = args[0].to_lowercase();
+    let first_is_lang = first == "auto" || find_language(&first).is_some();
+    if first_is_lang {
+        if args.len() >= 2 {
+            let second = args[1].to_lowercase();
+            if second == "auto" || find_language(&second).is_some() {
+                let content = if args.len() > 2 {
+                    Some(args[2..].join(" "))
+                } else {
+                    None
+                };
+                return (Some(first), Some(second), content);
+            }
+            let content = if args.len() > 1 {
+                Some(args[1..].join(" "))
+            } else {
+                None
+            };
+            return (Some(first), None, content);
+        }
+        return (Some(first), None, None);
+    }
+    (None, None, Some(args.join(" ")))
+}
+
+fn parse_cli(args: &[String]) -> CliAction {
+    let mut translate = false;
+    let mut set: Option<(String, String)> = None;
+    let mut translate_langs: Option<(String, String)> = None;
+    let mut translate_args: Vec<String> = Vec::new();
+    let mut performe = false;
+    let mut output: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-h" | "--help" => return CliAction::Help,
+            "-s" | "--set" => {
+                let mut langs: Vec<String> = Vec::new();
+                while langs.len() < 2 && i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    langs.push(args[i + 1].clone());
+                    i += 1;
+                }
+                if langs.len() == 2 {
+                    set = Some((langs[0].to_lowercase(), langs[1].to_lowercase()));
+                } else {
+                    eprintln!("Usage: ecapp -s <src> <tgt>  or  ecapp --set=<src>-><tgt>");
+                    std::process::exit(1);
+                }
+            }
+            s if s.starts_with("--set=") => match parse_arrow(&s[6..]) {
+                Some(p) => set = Some(p),
+                None => {
+                    eprintln!("Usage: ecapp '--set=<src>-><tgt>' (quote it, otherwise the shell treats '->' as a redirect)");
+                    std::process::exit(1);
+                }
+            },
+            "-t" | "--tra" | "--translation" => {
+                translate = true;
+                while i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    translate_args.push(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            s if s.starts_with("--tra=") => match parse_arrow(&s[6..]) {
+                Some(p) => {
+                    translate = true;
+                    translate_langs = Some(p);
+                    while i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                        translate_args.push(args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                None => {
+                    eprintln!("Usage: ecapp '--tra=<src>-><tgt>' (quote it, otherwise the shell treats '->' as a redirect)");
+                    std::process::exit(1);
+                }
+            },
+            s if s.starts_with("--translation=") => match parse_arrow(&s[14..]) {
+                Some(p) => {
+                    translate = true;
+                    translate_langs = Some(p);
+                    while i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                        translate_args.push(args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                None => {
+                    eprintln!("Usage: ecapp '--translation=<src>-><tgt>' (quote it, otherwise the shell treats '->' as a redirect)");
+                    std::process::exit(1);
+                }
+            },
+            "-p" | "--performe" | "--per" => performe = true,
+            "-o" => {
+                if i + 1 < args.len() {
+                    output = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Usage: ecapp -o <output-file>");
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                eprintln!("Unknown option '{a}'. Use 'ecapp -h' for help.");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if let Some((s, t)) = set {
+        return CliAction::Set { source: s, target: t };
+    }
+
+    if translate || performe {
+        let (source, target, content) = resolve_t_langs(&translate_args, translate_langs);
+        return CliAction::Translate {
+            source,
+            target,
+            content,
+            output: output.map(PathBuf::from),
+            performe,
+        };
+    }
+
+    CliAction::Interactive
+}
+
+fn validate_lang_pair(source: &str, target: &str) -> Result<(), String> {
+    if target.eq_ignore_ascii_case("auto") {
+        return Err("'auto' can only be the source language".into());
+    }
+    if !source.eq_ignore_ascii_case("auto") && find_language(source).is_none() {
+        return Err(format!("unknown source language '{source}'"));
+    }
+    if find_language(target).is_none() {
+        return Err(format!("unknown target language '{target}'"));
+    }
+    Ok(())
+}
+
+fn run_cli_translate(
+    agent: &Agent,
+    config: &ApiConfig,
+    source: Option<String>,
+    target: Option<String>,
+    content: Option<String>,
+    output: Option<PathBuf>,
+    performe: bool,
+) {
+    let (src, tgt) = match (source, target) {
+        (Some(s), Some(t)) => (s, t),
+        (Some(s), None) => {
+            let Some(t) = config.default_target.clone() else {
+                eprintln!("No default target language set. Use 'ecapp -s <src> <tgt>' or pass both languages.");
+                std::process::exit(1);
+            };
+            (s, t)
+        }
+        (None, _) => {
+            let Some(s) = config.default_source.clone() else {
+                eprintln!("No default languages set. Use 'ecapp -s <src> <tgt>' or pass both languages.");
+                std::process::exit(1);
+            };
+            let Some(t) = config.default_target.clone() else {
+                eprintln!("No default target language set. Use 'ecapp -s <src> <tgt>' or pass both languages.");
+                std::process::exit(1);
+            };
+            (s, t)
+        }
+    };
+
+    if let Err(e) = validate_lang_pair(&src, &tgt) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
+    if performe && content.is_none() && io::stdin().is_terminal() {
+        run_performe_mode(agent, config, &src, &tgt);
+        return;
+    }
+
+    let text = match content {
+        Some(c) if c.starts_with('@') => {
+            let path = &c[1..];
+            match fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("cannot read file '{path}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(c) => c,
+        None => {
+            if !io::stdin().is_terminal() {
+                let mut buf = String::new();
+                if let Err(e) = io::stdin().read_to_string(&mut buf) {
+                    eprintln!("read error: {e}");
+                    std::process::exit(1);
+                }
+                buf
+            } else {
+                eprintln!(
+                    "No text to translate. Provide text, @file, or pipe input \
+                     (e.g. man zip | ecapp -t en_us zh_cn)."
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    match translate_dispatch(agent, config, &text, &src, &tgt) {
+        Ok(translated) => {
+            if let Some(out) = output {
+                match fs::write(&out, &translated) {
+                    Ok(()) => println!("Translation written to {}.", out.display()),
+                    Err(e) => {
+                        eprintln!("cannot write '{}': {e}", out.display());
+                        std::process::exit(1);
+                    }
+                }
+            } else if io::stdout().is_terminal() {
+                println!("\x1b[32m{translated}\x1b[0m");
+            } else {
+                println!("{translated}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Translation failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────
 
 fn main() {
-    let mut rl = DefaultEditor::new().unwrap_or_else(|e| {
-        eprintln!("Failed to initialise line editor: {e}");
-        std::process::exit(1);
-    });
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
     let agent = Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(12)))
@@ -1399,7 +2066,44 @@ fn main() {
         .build()
         .into();
 
-    let mut config = load_config();
+    let config = load_config();
+
+    match parse_cli(&args) {
+        CliAction::Help => {
+            println!("{HELP_TEXT}");
+            return;
+        }
+        CliAction::Set { source, target } => {
+            if let Err(e) = validate_lang_pair(&source, &target) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            let mut cfg = config.clone();
+            cfg.default_source = Some(source.clone());
+            cfg.default_target = Some(target.clone());
+            save_config(&cfg);
+            println!("Default languages set: {source} -> {target}");
+            return;
+        }
+        CliAction::Translate {
+            source,
+            target,
+            content,
+            output,
+            performe,
+        } => {
+            run_cli_translate(&agent, &config, source, target, content, output, performe);
+            return;
+        }
+        CliAction::Interactive => {}
+    }
+
+    let mut rl = DefaultEditor::new().unwrap_or_else(|e| {
+        eprintln!("Failed to initialise line editor: {e}");
+        std::process::exit(1);
+    });
+
+    let mut config = config;
 
     println!("Welcome to ecapp — Terminal Translation Tool");
     println!("Type 'help' or 'h' for available commands.\n");
@@ -1420,6 +2124,51 @@ fn main() {
 
                 match line {
                     "help" | "h" => println!("{HELP_TEXT}"),
+                    "per" | "performe" => {
+                        match (
+                            config.default_source.clone(),
+                            config.default_target.clone(),
+                        ) {
+                            (Some(src), Some(tgt)) => {
+                                run_performe_mode(&agent, &config, &src, &tgt)
+                            }
+                            _ => {
+                                println!(
+                                    "No default languages set. Use 'set <src> <tgt>' or 'ecapp -s <src> <tgt>' first."
+                                );
+                            }
+                        }
+                    }
+                    "set" => {
+                        match (
+                            config.default_source.as_deref(),
+                            config.default_target.as_deref(),
+                        ) {
+                            (Some(src), Some(tgt)) => {
+                                println!("Default languages: {src} -> {tgt}");
+                            }
+                            _ => println!(
+                                "No default languages set. Usage: set <src> <tgt>"
+                            ),
+                        }
+                    }
+                    _ if line.starts_with("set ") => {
+                        let parts: Vec<&str> = line[4..].split_whitespace().collect();
+                        if parts.len() != 2 {
+                            println!("Usage: set <src> <tgt>");
+                            continue;
+                        }
+                        let src = parts[0].to_lowercase();
+                        let tgt = parts[1].to_lowercase();
+                        if let Err(e) = validate_lang_pair(&src, &tgt) {
+                            println!("{e}");
+                            continue;
+                        }
+                        config.default_source = Some(src.clone());
+                        config.default_target = Some(tgt.clone());
+                        save_config(&config);
+                        println!("Default languages set: {src} -> {tgt}");
+                    }
                     "api" => {
                         mode = AppMode::ApiConfig;
                         println!("Entering API configuration. Type 'help' for commands.\n");

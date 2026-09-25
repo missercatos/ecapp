@@ -1,53 +1,42 @@
-name: release
+name: aur-sync
 
+# Manually sync the AUR packages (ecapp and ecapp-bin) for an already
+# published release, using the release artifact's real sha256.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to sync, without the leading v (e.g. 0.3.2)'
+        required: true
+        type: string
 
 jobs:
-  release:
+  sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: build
-        run: cargo build --release --locked
-
-      - name: package
-        id: package
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TARBALL="ecapp-v${VERSION}-x86_64-linux.tar.gz"
-          mkdir -p dist
-          cp target/release/ecapp dist/
-          tar czf "dist/$TARBALL" -C dist ecapp
-          SHA256=$(sha256sum "dist/$TARBALL" | cut -d' ' -f1)
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-
-      - name: create release
+      - name: fetch release artifact and hash it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/${{ steps.package.outputs.tarball }}" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          TARBALL="ecapp-v${VERSION}-x86_64-linux.tar.gz"
+          mkdir -p /tmp/rel
+          gh release download "v${VERSION}" --pattern "$TARBALL" --dir /tmp/rel --clobber
+          SHA256=$(sha256sum "/tmp/rel/$TARBALL" | cut -d' ' -f1)
+          {
+            echo "VERSION=$VERSION"
+            echo "SHA256=$SHA256"
+          } >> "$GITHUB_ENV"
+          echo "Syncing $TARBALL (sha256=$SHA256)"
 
-      - name: sync aur packages
+      - name: set up AUR ssh key
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          set -ex
-          VERSION="${{ steps.package.outputs.version }}"
-          SHA256="${{ steps.package.outputs.sha256 }}"
-
+          set -euo pipefail
           mkdir -p ~/.ssh
           echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
@@ -58,6 +47,9 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
+      - name: sync AUR packages
+        run: |
+          set -ex
           for repo in ecapp ecapp-bin; do
             rm -rf "/tmp/aur-$repo"
             git clone "ssh://aur@aur.archlinux.org/${repo}.git" "/tmp/aur-$repo"

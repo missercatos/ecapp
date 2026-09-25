@@ -27,6 +27,10 @@ Translation, and DeepL.
 - **Performe mode (real-time translation)** — `ecapp -p` shows the translation
   of whatever you are typing at the bottom of the terminal, updating live as
   you type, delete, or edit.
+- **Automatic source failover** — multiple translation sources are built in;
+  when the active one fails (down, quota, network), ecapp automatically
+  switches to another available source and remembers the dead one for the rest
+  of the run.
 
 ---
 
@@ -201,6 +205,32 @@ internal `set` command, or pass explicit languages with `ecapp -t zh_cn en_us -p
 | `Ctrl+U` | Clear the current input line          |
 | `Ctrl+J` | Insert a newline (multi-line input)   |
 | `Ctrl+C` | Interrupt / cancel                    |
+
+---
+
+## Translation sources and automatic failover
+
+| Backend    | Key needed | Notes                                        |
+| ---------- | ---------- | -------------------------------------------- |
+| `mymemory` | no         | free, default; ~500 chars per request        |
+| `gtx`      | no         | free Google endpoint                         |
+| `lingva`   | no         | Lingva Translate (free Google frontend)      |
+| `google`   | yes        | Google Cloud Translation                     |
+| `deepl`    | yes        | DeepL (free tier: 500k chars/month)          |
+
+Choose the active source with `ecapp` → `api` → `set <backend>`, or let the
+default (`mymemory`) stand.
+
+**Automatic failover:** whenever the active source fails — it is unreachable,
+out of quota, or returns an error — ecapp immediately retries with the next
+available source. Key-less sources are always available; keyed sources only
+join the chain once an API key is set. A source that failed during the current
+run is skipped afterwards, so long files and performe mode do not keep hitting
+a dead source. Switch notices are printed to stderr, keeping stdout clean for
+pipes and redirection.
+
+Long inputs are chunked to fit the strictest limit of every source in the
+chain, so falling back never exceeds a backend's per-request limit.
 
 ---
 

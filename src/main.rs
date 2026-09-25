@@ -46,6 +46,10 @@ CLI Usage (one-shot, works without entering the interactive shell):
 Main Mode Commands:
   help, h                 Show this help
   api                     Manage translation API backend and keys
+                          Sources: mymemory, gtx, lingva (free, no key)
+                                   google, deepl (need API key)
+                          If the active source fails, ecapp automatically
+                          switches to another available source.
   translate, tra          Enter translation mode (guided setup)
   tra /<src> ~ <tgt>      Enter translation mode directly
                           Example: tra /en_us ~ zh_cn
@@ -233,10 +237,79 @@ impl Default for ApiConfig {
 }
 
 const BACKENDS: &[(&str, &str, &str)] = &[
-    ("mymemory", "MyMemory",        "Free, no key required"),
-    ("google",   "Google Translate", "Needs API key (Cloud Translation)"),
-    ("deepl",    "DeepL",            "Needs API key (free tier: 500k chars/mo)"),
+    ("mymemory", "MyMemory",         "Free, no key required"),
+    ("gtx",      "Google (free)",     "Free Google endpoint, no key required"),
+    ("lingva",   "Lingva Translate",  "Free Google frontend, no key required"),
+    ("google",   "Google Translate",  "Needs API key (Cloud Translation)"),
+    ("deepl",    "DeepL",             "Needs API key (free tier: 500k chars/mo)"),
 ];
+
+/// Whether a backend can be used with the current config (key present etc.).
+fn backend_available(config: &ApiConfig, id: &str) -> bool {
+    match id {
+        "google" | "deepl" => config
+            .api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
+        _ => true,
+    }
+}
+
+/// Backends that failed during this run; they are skipped so a dead source
+/// is not retried for every chunk / keystroke.
+fn dead_backends() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static DEAD: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    DEAD.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn mark_backend_dead(id: &str) {
+    if let Ok(mut dead) = dead_backends().lock() {
+        dead.insert(id.to_string());
+    }
+}
+
+fn clear_dead_backends() {
+    if let Ok(mut dead) = dead_backends().lock() {
+        dead.clear();
+    }
+}
+
+/// Backends to try, in order: the configured one first, then every other
+/// usable backend. Used for automatic failover when a source goes down.
+/// Sources that already failed in this run are skipped.
+fn translation_chain(config: &ApiConfig) -> Vec<String> {
+    let mut full: Vec<String> = Vec::new();
+    if backend_available(config, &config.backend) {
+        full.push(config.backend.clone());
+    }
+    for (id, _, _) in BACKENDS {
+        if *id != config.backend && backend_available(config, id) {
+            full.push((*id).to_string());
+        }
+    }
+    let all_dead = match dead_backends().lock() {
+        Ok(guard) => {
+            let alive: Vec<String> = full
+                .iter()
+                .filter(|b| !guard.contains(*b))
+                .cloned()
+                .collect();
+            if !alive.is_empty() {
+                return alive;
+            }
+            true
+        }
+        Err(_) => false,
+    };
+    if all_dead {
+        // Everything failed before — retry from a clean slate so a transient
+        // outage can recover.
+        clear_dead_backends();
+    }
+    full
+}
 
 fn config_path() -> PathBuf {
     let mut p = dirs_home();
@@ -295,13 +368,36 @@ struct MmResponse {
     #[serde(rename = "responseData")]
     response_data: MmData,
     #[serde(rename = "responseStatus")]
-    response_status: Option<i32>,
+    response_status: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
 struct MmData {
     #[serde(rename = "translatedText")]
     translated_text: String,
+}
+
+/// MyMemory returns the status sometimes as a number, sometimes as a string.
+fn mm_status_ok(status: &Option<serde_json::Value>) -> bool {
+    match status {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Number(n)) => {
+            matches!(n.as_i64(), Some(200) | Some(202))
+        }
+        Some(serde_json::Value::String(s)) => s == "200" || s == "202" || s.is_empty(),
+        _ => false,
+    }
+}
+
+/// MyMemory reports quota/usage problems in the translated text with a 200
+/// status, so detect those too and treat them as failures.
+fn mm_text_ok(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty()
+        && !t.starts_with("MYMEMORY WARNING")
+        && !t.contains("QUERY LENGTH LIMIT")
+        && !t.eq_ignore_ascii_case("PLEASE SELECT TWO DISTINCT LANGUAGES")
+        && !t.eq_ignore_ascii_case("INVALID LANGUAGE PAIR")
 }
 
 fn mymemory_query(agent: &Agent, url: &str) -> Result<MmResponse, String> {
@@ -399,9 +495,13 @@ fn translate_via_mymemory_auto(
         tgt.api_code,
     );
     let body = mymemory_query(agent, &url)?;
-    match body.response_status {
-        Some(200) | Some(202) | None => Ok(body.response_data.translated_text),
-        Some(s) => Err(format!("API error (status {s})")),
+    if mm_status_ok(&body.response_status) && mm_text_ok(&body.response_data.translated_text) {
+        Ok(body.response_data.translated_text)
+    } else {
+        Err(format!(
+            "bad response ({})",
+            body.response_data.translated_text
+        ))
     }
 }
 
@@ -430,9 +530,13 @@ fn translate_via_mymemory(
 
     let body = mymemory_query(agent, &url)?;
 
-    match body.response_status {
-        Some(200) | Some(202) | None => Ok(body.response_data.translated_text),
-        Some(s) => Err(format!("API error (status {s})")),
+    if mm_status_ok(&body.response_status) && mm_text_ok(&body.response_data.translated_text) {
+        Ok(body.response_data.translated_text)
+    } else {
+        Err(format!(
+            "bad response ({})",
+            body.response_data.translated_text
+        ))
     }
 }
 
@@ -546,6 +650,43 @@ fn translate_deepl(
         .ok_or_else(|| "no translation".into())
 }
 
+fn translate_dispatch_opts(
+    agent: &Agent,
+    config: &ApiConfig,
+    text: &str,
+    source: &str,
+    target: &str,
+    notify: bool,
+) -> Result<String, String> {
+    if target.eq_ignore_ascii_case("auto") {
+        return Err("'auto' can only be the source language".into());
+    }
+    let chain = translation_chain(config);
+    if chain.is_empty() {
+        return Err("no translation backend available".into());
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut last_failed: Option<&str> = None;
+    for backend in chain.iter() {
+        match translate_single(agent, config, backend, text, source, target) {
+            Ok(t) => {
+                if let Some(failed) = last_failed
+                    && notify
+                {
+                    eprintln!("ecapp: '{failed}' unavailable, switched to '{backend}'");
+                }
+                return Ok(t);
+            }
+            Err(e) => {
+                mark_backend_dead(backend);
+                last_failed = Some(backend.as_str());
+                errors.push(format!("{backend}: {e}"));
+            }
+        }
+    }
+    Err(format!("all translation sources failed ({})", errors.join(" | ")))
+}
+
 fn translate_dispatch(
     agent: &Agent,
     config: &ApiConfig,
@@ -553,26 +694,154 @@ fn translate_dispatch(
     source: &str,
     target: &str,
 ) -> Result<String, String> {
-    if target.eq_ignore_ascii_case("auto") {
-        return Err("'auto' can only be the source language".into());
-    }
-    match config.backend.as_str() {
+    translate_dispatch_opts(agent, config, text, source, target, true)
+}
+
+/// Translate with one specific backend.
+fn translate_single(
+    agent: &Agent,
+    config: &ApiConfig,
+    backend: &str,
+    text: &str,
+    source: &str,
+    target: &str,
+) -> Result<String, String> {
+    match backend {
+        "gtx" => translate_gtx(agent, text, source, target),
+        "lingva" => translate_lingva(agent, text, source, target),
         "google" => {
             let key = config.api_key.as_deref().unwrap_or("");
             if key.is_empty() {
-                return Err("Google API key not set. Use 'api' command to configure.".into());
+                return Err("Google API key not set".into());
             }
             translate_google(agent, key, text, source, target)
         }
         "deepl" => {
             let key = config.api_key.as_deref().unwrap_or("");
             if key.is_empty() {
-                return Err("DeepL API key not set. Use 'api' command to configure.".into());
+                return Err("DeepL API key not set".into());
             }
             translate_deepl(agent, key, text, source, target)
         }
         _ => translate_via_mymemory(agent, text, source, target),
     }
+}
+
+/// Free, key-less Google endpoint (translate_a/single).
+fn translate_gtx(
+    agent: &Agent,
+    text: &str,
+    source_code: &str,
+    target_code: &str,
+) -> Result<String, String> {
+    let tgt = find_language(target_code)
+        .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
+    let sl = if source_code.eq_ignore_ascii_case("auto") {
+        "auto".to_string()
+    } else {
+        find_language(source_code)
+            .ok_or_else(|| format!("unknown source language '{source_code}'"))?
+            .api_code
+            .to_string()
+    };
+
+    let url = format!(
+        "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&q={}",
+        url_encode(&sl),
+        url_encode(tgt.api_code),
+        url_encode(text),
+    );
+
+    let resp = agent
+        .get(&url)
+        .header("User-Agent", "ecapp/0.3")
+        .call()
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let mut buf = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read error: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&buf).map_err(|e| format!("parse error: {e}"))?;
+
+    let segments = v
+        .get(0)
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| "unexpected response".to_string())?;
+    let mut out = String::new();
+    for seg in segments {
+        if let Some(t) = seg.get(0).and_then(|x| x.as_str()) {
+            out.push_str(t);
+        }
+    }
+    if out.is_empty() {
+        Err("empty translation".into())
+    } else {
+        Ok(out)
+    }
+}
+
+/// Free Lingva Translate instances (Google frontend).
+const LINGVA_INSTANCES: &[&str] = &[
+    "https://lingva.ml",
+    "https://lingva.thedaviddelta.com",
+    "https://translate.plausibility.cloud",
+];
+
+fn translate_lingva(
+    agent: &Agent,
+    text: &str,
+    source_code: &str,
+    target_code: &str,
+) -> Result<String, String> {
+    let tgt = find_language(target_code)
+        .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
+    let sl = if source_code.eq_ignore_ascii_case("auto") {
+        "auto".to_string()
+    } else {
+        find_language(source_code)
+            .ok_or_else(|| format!("unknown source language '{source_code}'"))?
+            .api_code
+            .to_string()
+    };
+    // Lingva uses the base Chinese code.
+    let tl = if tgt.api_code.to_lowercase().starts_with("zh") {
+        "zh".to_string()
+    } else {
+        tgt.api_code.to_string()
+    };
+
+    let mut last_err = String::new();
+    for instance in LINGVA_INSTANCES {
+        let url = format!(
+            "{instance}/api/v1/{}/{}/{}",
+            url_encode(&sl),
+            url_encode(&tl),
+            url_encode(text),
+        );
+        let resp = match agent.get(&url).header("User-Agent", "ecapp/0.3").call() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("network error: {e}");
+                continue;
+            }
+        };
+        let mut buf = Vec::new();
+        if let Err(e) = resp.into_body().as_reader().read_to_end(&mut buf) {
+            last_err = format!("read error: {e}");
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(&buf) {
+            Ok(v) => match v.get("translation").and_then(|t| t.as_str()) {
+                Some(t) if !t.is_empty() => return Ok(t.to_string()),
+                _ => last_err = "empty translation".into(),
+            },
+            Err(e) => last_err = format!("parse error: {e}"),
+        }
+    }
+    Err(last_err)
 }
 
 // ── free dictionary API ───────────────────────────────────────────────
@@ -1484,7 +1753,9 @@ fn raw_performe_input(
                         if text.is_empty() {
                             show_bottom_bar("", start_row, canvas.rows_used)?;
                         } else {
-                            match translate_dispatch(agent, config, &text, source, target) {
+                            match translate_dispatch_opts(
+                                agent, config, &text, source, target, false,
+                            ) {
                                 Ok(t) => {
                                     show_bottom_bar(&t, start_row, canvas.rows_used)?
                                 }
@@ -1961,8 +2232,18 @@ fn validate_lang_pair(source: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Per-request size limit of each backend (safe values, in bytes).
+fn backend_chunk_limit(id: &str) -> usize {
+    match id {
+        "mymemory" => 450,
+        "gtx" => 1500,
+        "lingva" => 1000,
+        _ => 15000,
+    }
+}
+
 /// Split long text into chunks that fit the backend's per-request limit
-/// (MyMemory: 500 bytes). Breaks at newlines when possible.
+/// (MyMemory: 500 chars). Breaks at newlines when possible.
 fn chunk_text(text: &str, limit_bytes: usize) -> Vec<String> {
     if text.len() <= limit_bytes {
         return vec![text.to_string()];
@@ -1994,7 +2275,12 @@ fn translate_text_chunked(
     src: &str,
     tgt: &str,
 ) -> Result<String, String> {
-    let limit = if config.backend == "mymemory" { 450 } else { 15000 };
+    // Chunk by the strictest limit among the backends we may fall back to.
+    let limit = translation_chain(config)
+        .iter()
+        .map(|b| backend_chunk_limit(b))
+        .min()
+        .unwrap_or(450);
     let chunks = chunk_text(text, limit);
     if chunks.len() == 1 {
         return translate_dispatch(agent, config, &chunks[0], src, tgt);
@@ -2432,7 +2718,7 @@ fn main() {
                         println!();
                         println!("  API Configuration Commands:");
                         println!("    show                 Display current config");
-                        println!("    set <backend>        Switch backend (mymemory / google / deepl)");
+                        println!("    set <backend>        Switch backend (mymemory / gtx / lingva / google / deepl)");
                         println!("    key <api-key>        Set API key for current backend");
                         println!("    key                  Clear the API key");
                         println!("    exit                 Return to main mode");
@@ -2471,7 +2757,7 @@ fn main() {
                                 .unwrap_or("");
                             println!("Switched to {name}. Remember to set an API key with 'key'.");
                         } else {
-                            println!("Unknown backend '{backend}'. Available: mymemory, google, deepl");
+                            println!("Unknown backend '{backend}'. Available: mymemory, gtx, lingva, google, deepl");
                         }
                     }
                     _ if line.starts_with("key ") => {
@@ -2542,5 +2828,65 @@ mod tests {
         assert_eq!(detect_side("사과", "en_us", "ko_kr"), WordSide::Target);
         assert_eq!(detect_side("แอปเปิล", "th_th", "en_us"), WordSide::Source);
         assert_eq!(detect_side("แอปเปิล", "en_us", "th_th"), WordSide::Target);
+    }
+
+    #[test]
+    fn auto_language_detection() {
+        assert_eq!(detect_language_code("hello there"), "en_us");
+        assert_eq!(detect_language_code("你好世界"), "zh_cn");
+        assert_eq!(detect_language_code("こんにちは"), "ja_jp");
+        assert_eq!(detect_language_code("안녕하세요"), "ko_kr");
+        assert_eq!(detect_language_code("Привет"), "ru_ru");
+    }
+
+    #[test]
+    fn chunking_respects_limit() {
+        let text = "a".repeat(1000);
+        let chunks = chunk_text(&text, 450);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|c| c.len() <= 450));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn chunking_breaks_on_newline() {
+        // Once the buffer is full, a newline ends the chunk (the join in
+        // translate_text_chunked re-inserts the newline).
+        let text = format!("{}\n{}", "x".repeat(450), "y".repeat(10));
+        let chunks = chunk_text(&text, 450);
+        assert_eq!(chunks, vec!["x".repeat(450), "y".repeat(10)]);
+    }
+
+    #[test]
+    fn backend_availability_requires_key() {
+        let mut cfg = ApiConfig::default();
+        assert!(backend_available(&cfg, "mymemory"));
+        assert!(backend_available(&cfg, "gtx"));
+        assert!(backend_available(&cfg, "lingva"));
+        assert!(!backend_available(&cfg, "google"));
+        assert!(!backend_available(&cfg, "deepl"));
+        cfg.api_key = Some("k".into());
+        assert!(backend_available(&cfg, "google"));
+        assert!(backend_available(&cfg, "deepl"));
+    }
+
+    #[test]
+    fn chain_starts_with_configured_backend() {
+        clear_dead_backends();
+        let cfg = ApiConfig { backend: "gtx".into(), ..Default::default() };
+        let chain = translation_chain(&cfg);
+        assert_eq!(chain.first().map(String::as_str), Some("gtx"));
+        assert!(chain.iter().any(|b| b == "mymemory"));
+        assert!(!chain.iter().any(|b| b == "google"));
+    }
+
+    #[test]
+    fn dead_backends_are_skipped() {
+        clear_dead_backends();
+        mark_backend_dead("mymemory");
+        let cfg = ApiConfig::default();
+        let chain = translation_chain(&cfg);
+        assert!(!chain.iter().any(|b| b == "mymemory"));
+        clear_dead_backends();
     }
 }

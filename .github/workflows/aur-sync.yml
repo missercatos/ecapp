@@ -13,6 +13,8 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -71,3 +73,6 @@ jobs:
               fi
             )
           done
+
+      - name: sync repository PKGBUILD with CI artifact hash
+        run: bash .github/scripts/backfill-pkgbuild.sh

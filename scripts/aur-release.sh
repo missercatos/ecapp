@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
+# Build, tag and push a release.
+#
+# GitHub Actions (.github/workflows/release.yml) rebuilds the tarball, publishes
+# the release, syncs the AUR packages (ecapp + ecapp-bin) and finally writes the
+# CI artifact's real sha256 back into PKGBUILD/.SRCINFO on master.
+#
+# The local build below is only a sanity check. Its hash is NOT the hash of the
+# published artifact: CI rebuilds the binary, so the bytes differ. The provisional
+# hash committed here is replaced by the workflow once the release exists.
 set -euo pipefail
 
 usage() {
   echo "Usage: $0 <version>"
-  echo "Example: $0 0.2.0"
+  echo "Example: $0 0.3.2"
   exit 1
 }
 
@@ -28,9 +37,9 @@ cp target/release/ecapp dist/
 tar czf "dist/$TARBALL" -C dist ecapp
 
 SHA256=$(sha256sum "dist/$TARBALL" | cut -d' ' -f1)
-echo "  SHA256: $SHA256"
+echo "  local SHA256: $SHA256 (provisional, CI will publish a different hash)"
 
-echo "=== Updating PKGBUILD ==="
+echo "=== Updating PKGBUILD (provisional hash) ==="
 
 sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
 sed -i "s/^sha256sums=('.*')/sha256sums=('$SHA256')/" PKGBUILD
@@ -43,24 +52,10 @@ git tag "$TAG"
 git push "$REMOTE" HEAD
 git push "$REMOTE" "$TAG"
 
-echo "=== Syncing AUR ecapp-bin ==="
-
-AUR_REMOTE="ssh://aur@aur.archlinux.org/ecapp-bin.git"
-AUR_TMP=$(mktemp -d)
-
-git clone "$AUR_REMOTE" "$AUR_TMP"
-cp PKGBUILD "$AUR_TMP/"
-cd "$AUR_TMP"
-if command -v makepkg &>/dev/null; then
-  makepkg --printsrcinfo > .SRCINFO
-fi
-git add PKGBUILD .SRCINFO
-git commit -m "update to v${VERSION}"
-git push
-
-rm -rf "$AUR_TMP"
-
 echo ""
-echo "=== Done. ecapp-bin v${VERSION} released to GitHub and AUR. ==="
-echo "  GitHub:  https://github.com/missercatos/ecapp/releases/tag/${TAG}"
-echo "  AUR:     https://aur.archlinux.org/packages/ecapp-bin"
+echo "=== Tag ${TAG} pushed. Remaining work runs in GitHub Actions: ==="
+echo "  - build + publish the release tarball"
+echo "  - sync AUR packages ecapp and ecapp-bin"
+echo "  - backfill PKGBUILD/.SRCINFO with the CI artifact hash on master"
+echo ""
+echo "  Progress: https://github.com/missercatos/ecapp/actions/workflows/release.yml"

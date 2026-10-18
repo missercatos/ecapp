@@ -79,3 +79,9 @@ jobs:
               fi
             )
           done
+
+      - name: sync repository PKGBUILD with CI artifact hash
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        run: bash .github/scripts/backfill-pkgbuild.sh

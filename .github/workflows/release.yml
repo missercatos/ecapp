@@ -67,6 +67,7 @@ jobs:
               sed -i "s/^sha256sums=('.*')/sha256sums=('$SHA256')/" PKGBUILD
               sed -i "s/^\tpkgver = .*/\tpkgver = $VERSION/" .SRCINFO
               sed -i "s/^\tsha256sums = .*/\tsha256sums = $SHA256/" .SRCINFO
+              sed -i "s|releases/download/v[^/]*/ecapp-v[^/]*-x86_64-linux.tar.gz|releases/download/v$VERSION/ecapp-v$VERSION-x86_64-linux.tar.gz|" .SRCINFO
               git config user.name "github-actions[bot]"
               git config user.email "github-actions[bot]@users.noreply.github.com"
               git add PKGBUILD .SRCINFO

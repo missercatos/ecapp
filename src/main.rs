@@ -43,6 +43,9 @@ CLI Usage (one-shot, works without entering the interactive shell):
   ecapp --set=<src>-><tgt>                 Same
   ecapp -p, --performe, --per              Real-time translation mode
   ecapp -t <src> <tgt> -p                  Performe mode with explicit languages
+  ecapp -capi [id|url]                     Show or switch the translation API
+  ecapp --changeAPI <id|url>               Same, e.g. gtx / lingva / https://...
+  ecapp --import-dict <file>               Import a local dictionary (experimental)
 
   auto: the source language may be 'auto' (only as source) to detect the
         input language automatically. Examples:
@@ -53,9 +56,10 @@ Main Mode Commands:
   help, h                 Show this help
   api                     Manage translation API backend and keys
                           Sources: mymemory, gtx, lingva (free, no key)
-                                   google, deepl (need API key)
+                                   google, deepl (need API key), custom URL
                           If the active source fails, ecapp automatically
-                          switches to another available source.
+                          switches to a working one and locks onto it until
+                          it fails again.
   translate, tra          Enter translation mode (guided setup)
   tra /<src> ~ <tgt>      Enter translation mode directly
                           Example: tra /en_us ~ zh_cn
@@ -89,6 +93,15 @@ Keyboard Shortcuts:
   Ctrl+C                  Interrupt / cancel
 
   Multi-line text — typed with Ctrl+J or pasted — is translated as one block.
+
+Local dictionary (experimental):
+  Import a TSV/CSV file with `--import-dict <file>` or the `dict <file>`
+  command in the `api` menu. Each line is either
+      source<TAB>target
+  or
+      src_lang<TAB>tgt_lang<TAB>source<TAB>target
+  (`*` = any language). Entries override exact inputs and are used by
+  dictionary mode (tra-dir).
 
 Language codes use Arch-style format: lowercase with underscore
 (e.g., en_us, zh_cn, ja_jp, fr_fr, de_de, es_es, pt_br, ru_ru).
@@ -226,6 +239,8 @@ struct ApiConfig {
     backend: String,
     api_key: Option<String>,
     #[serde(default)]
+    custom_url: Option<String>,
+    #[serde(default)]
     default_source: Option<String>,
     #[serde(default)]
     default_target: Option<String>,
@@ -236,6 +251,7 @@ impl Default for ApiConfig {
         Self {
             backend: "mymemory".into(),
             api_key: None,
+            custom_url: None,
             default_source: None,
             default_target: None,
         }
@@ -248,6 +264,7 @@ const BACKENDS: &[(&str, &str, &str)] = &[
     ("lingva",   "Lingva Translate",  "Free Google frontend, no key required"),
     ("google",   "Google Translate",  "Needs API key (Cloud Translation)"),
     ("deepl",    "DeepL",             "Needs API key (free tier: 500k chars/mo)"),
+    ("custom",   "Custom URL",        "Lingva-compatible endpoint or URL template"),
 ];
 
 /// Whether a backend can be used with the current config (key present etc.).
@@ -257,8 +274,62 @@ fn backend_available(config: &ApiConfig, id: &str) -> bool {
             .api_key
             .as_deref()
             .is_some_and(|k| !k.is_empty()),
+        "custom" => config
+            .custom_url
+            .as_deref()
+            .is_some_and(|u| !u.is_empty()),
         _ => true,
     }
+}
+
+fn backend_name(id: &str) -> &'static str {
+    BACKENDS
+        .iter()
+        .find(|(bid, _, _)| *bid == id)
+        .map(|(_, name, _)| *name)
+        .unwrap_or("Unknown")
+}
+
+/// The backend that automatically proved to work in this run. It takes
+/// precedence over the one stored in the config so that a successful
+/// failover stays locked until it breaks as well.
+fn active_backend() -> &'static std::sync::Mutex<Option<String>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn effective_backend(config: &ApiConfig) -> String {
+    active_backend()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| config.backend.clone())
+}
+
+fn set_active_backend(id: Option<&str>) {
+    if let Ok(mut active) = active_backend().lock() {
+        *active = id.map(str::to_string);
+    }
+}
+
+/// Remember a backend that just worked, persist it as the preferred one, and
+/// keep using it until it fails.
+fn lock_backend(config: &ApiConfig, id: &str) {
+    {
+        let Ok(active) = active_backend().lock() else {
+            return;
+        };
+        if active.as_deref() == Some(id) {
+            return;
+        }
+        if active.is_none() && config.backend == id {
+            // The configured backend worked; nothing to switch.
+            return;
+        }
+    }
+    set_active_backend(Some(id));
+    save_config(config);
 }
 
 /// Backends that failed during this run; they are skipped so a dead source
@@ -274,6 +345,12 @@ fn mark_backend_dead(id: &str) {
     if let Ok(mut dead) = dead_backends().lock() {
         dead.insert(id.to_string());
     }
+    // Release the lock so the next backend can take over.
+    if let Ok(mut active) = active_backend().lock()
+        && active.as_deref() == Some(id)
+    {
+        *active = None;
+    }
 }
 
 fn clear_dead_backends() {
@@ -286,12 +363,13 @@ fn clear_dead_backends() {
 /// usable backend. Used for automatic failover when a source goes down.
 /// Sources that already failed in this run are skipped.
 fn translation_chain(config: &ApiConfig) -> Vec<String> {
+    let preferred = effective_backend(config);
     let mut full: Vec<String> = Vec::new();
-    if backend_available(config, &config.backend) {
-        full.push(config.backend.clone());
+    if backend_available(config, &preferred) {
+        full.push(preferred.clone());
     }
     for (id, _, _) in BACKENDS {
-        if *id != config.backend && backend_available(config, id) {
+        if *id != preferred && backend_available(config, id) {
             full.push((*id).to_string());
         }
     }
@@ -343,9 +421,100 @@ fn load_config() -> ApiConfig {
 }
 
 fn save_config(cfg: &ApiConfig) {
+    let mut out = cfg.clone();
+    // Keep the backend that automatic failover locked onto.
+    out.backend = effective_backend(cfg);
     let dir = config_path();
     let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(config_file(), serde_json::to_string_pretty(cfg).unwrap_or_default());
+    let _ = fs::write(
+        config_file(),
+        serde_json::to_string_pretty(&out).unwrap_or_default(),
+    );
+}
+
+fn describe_backend(config: &ApiConfig, id: &str) -> String {
+    if id == "custom" {
+        format!(
+            "custom ({})",
+            config.custom_url.as_deref().unwrap_or("no URL")
+        )
+    } else {
+        format!("{id} ({})", backend_name(id))
+    }
+}
+
+/// Apply an explicit `-capi` change: a backend id, `custom`, or an http(s)
+/// URL (stored as a Lingva-compatible custom endpoint).
+fn apply_api_change(config: &mut ApiConfig, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("empty API name/URL".into());
+    }
+
+    let lower = value.to_lowercase();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        config.custom_url = Some(value.trim_end_matches('/').to_string());
+        config.backend = "custom".into();
+    } else if lower == "custom" {
+        if config
+            .custom_url
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(
+                "no custom URL set yet; use: ecapp -capi https://your-lingva-instance"
+                    .into(),
+            );
+        }
+        config.backend = "custom".into();
+    } else if BACKENDS.iter().any(|(id, _, _)| *id == lower) {
+        config.backend = lower;
+    } else {
+        return Err(format!(
+            "unknown API '{value}'. Use mymemory, gtx, lingva, google, deepl, custom, or an http(s) URL"
+        ));
+    }
+
+    // An explicit choice overrides any automatic lock.
+    set_active_backend(Some(&config.backend));
+    clear_dead_backends();
+    save_config(config);
+
+    let mut message = format!("Active API: {}", describe_backend(config, &config.backend));
+    if matches!(config.backend.as_str(), "google" | "deepl")
+        && !config.api_key.as_deref().is_some_and(|k| !k.is_empty())
+    {
+        message.push_str(
+            "\nNote: this backend needs an API key; set it in the interactive 'api' menu.",
+        );
+    }
+    Ok(message)
+}
+
+fn show_api_config(config: &ApiConfig) {
+    let active = effective_backend(config);
+    println!();
+    println!("  Current API: {}", describe_backend(config, &active));
+    for (id, name, desc) in BACKENDS {
+        let mark = if *id == active { " [ACTIVE]" } else { "" };
+        println!("    {id:<10} {name:<18} {desc}{mark}");
+    }
+    if let Some(url) = config.custom_url.as_deref() {
+        println!("  Custom URL: {url}");
+    }
+    if let Some(key) = config.api_key.as_deref().filter(|k| !k.is_empty()) {
+        println!("  API key: {}", mask_key(key));
+    } else {
+        println!("  API key: (not set)");
+    }
+    let file = dict_file();
+    println!(
+        "  Local dictionary: {} ({} entries, experimental)",
+        file.display(),
+        dictionary_count()
+    );
+    println!();
 }
 
 // ── url helpers ───────────────────────────────────────────────────────
@@ -667,6 +836,10 @@ fn translate_dispatch_opts(
     if target.eq_ignore_ascii_case("auto") {
         return Err("'auto' can only be the source language".into());
     }
+    // Local dictionary entries override the network sources.
+    if let Some(local) = local_lookup(source, target, text) {
+        return Ok(local);
+    }
     let chain = translation_chain(config);
     if chain.is_empty() {
         return Err("no translation backend available".into());
@@ -676,10 +849,14 @@ fn translate_dispatch_opts(
     for backend in chain.iter() {
         match translate_single(agent, config, backend, text, source, target) {
             Ok(t) => {
+                // Stick to the source that actually works until it breaks.
+                lock_backend(config, backend);
                 if let Some(failed) = last_failed
                     && notify
                 {
-                    eprintln!("ecapp: '{failed}' unavailable, switched to '{backend}'");
+                    eprintln!(
+                        "ecapp: '{failed}' unavailable, switched to '{backend}' (locked)"
+                    );
                 }
                 return Ok(t);
             }
@@ -715,6 +892,7 @@ fn translate_single(
     match backend {
         "gtx" => translate_gtx(agent, text, source, target),
         "lingva" => translate_lingva(agent, text, source, target),
+        "custom" => translate_custom(agent, config, text, source, target),
         "google" => {
             let key = config.api_key.as_deref().unwrap_or("");
             if key.is_empty() {
@@ -848,6 +1026,96 @@ fn translate_lingva(
         }
     }
     Err(last_err)
+}
+
+/// Build the request URL for a user-supplied endpoint. A URL containing
+/// `{sl}`, `{tl}` or `{text}` is treated as a template; any other value is
+/// treated as a Lingva-compatible base URL.
+fn build_custom_url(
+    config: &ApiConfig,
+    text: &str,
+    source_code: &str,
+    target_code: &str,
+) -> Result<String, String> {
+    let base = config
+        .custom_url
+        .as_deref()
+        .ok_or_else(|| "custom API URL not set".to_string())?;
+    let tgt = find_language(target_code)
+        .ok_or_else(|| format!("unknown target language '{target_code}'"))?;
+    let sl = if source_code.eq_ignore_ascii_case("auto") {
+        "auto".to_string()
+    } else {
+        find_language(source_code)
+            .ok_or_else(|| format!("unknown source language '{source_code}'"))?
+            .api_code
+            .to_string()
+    };
+    // Lingva uses the base Chinese code; templates get the normal API code.
+    let mut tl = tgt.api_code.to_string();
+
+    if base.contains("{text}") || base.contains("{sl}") || base.contains("{tl}") {
+        Ok(base
+            .replace("{sl}", &url_encode(&sl))
+            .replace("{tl}", &url_encode(&tl))
+            .replace("{text}", &url_encode(text)))
+    } else {
+        if tl.to_lowercase().starts_with("zh") {
+            tl = "zh".to_string();
+        }
+        Ok(format!(
+            "{}/api/v1/{}/{}/{}",
+            base.trim_end_matches('/'),
+            url_encode(&sl),
+            url_encode(&tl),
+            url_encode(text),
+        ))
+    }
+}
+
+fn translate_custom(
+    agent: &Agent,
+    config: &ApiConfig,
+    text: &str,
+    source_code: &str,
+    target_code: &str,
+) -> Result<String, String> {
+    let url = build_custom_url(config, text, source_code, target_code)?;
+    let resp = agent
+        .get(&url)
+        .header("User-Agent", "ecapp/0.5")
+        .call()
+        .map_err(|e| format!("network error: {e}"))?;
+
+    let mut buf = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read error: {e}"))?;
+
+    match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(value) => {
+            for key in ["translation", "translatedText", "text"] {
+                if let Some(t) = value.get(key).and_then(|v| v.as_str())
+                    && !t.is_empty()
+                {
+                    return Ok(t.to_string());
+                }
+            }
+            Err("unexpected JSON response (no 'translation' field)".into())
+        }
+        Err(_) => {
+            let body = String::from_utf8_lossy(&buf);
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                Err("empty translation".into())
+            } else if trimmed.starts_with('<') {
+                Err("custom endpoint returned HTML, not a translation".into())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+    }
 }
 
 // ── free dictionary API ───────────────────────────────────────────────
@@ -1005,6 +1273,198 @@ fn is_single_word(text: &str) -> bool {
     !trimmed.is_empty() && !trimmed.contains(' ')
 }
 
+// ── local dictionary (experimental) ───────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalEntry {
+    src_lang: String,
+    tgt_lang: String,
+    source: String,
+    target: String,
+}
+
+fn dict_file() -> PathBuf {
+    config_path().join("dictionary.tsv")
+}
+
+fn local_dict() -> &'static std::sync::Mutex<Option<Vec<LocalEntry>>> {
+    static DICT: std::sync::OnceLock<std::sync::Mutex<Option<Vec<LocalEntry>>>> =
+        std::sync::OnceLock::new();
+    DICT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn ensure_local_dict_loaded() {
+    let Ok(mut cache) = local_dict().lock() else {
+        return;
+    };
+    if cache.is_some() {
+        return;
+    }
+    let entries = fs::read_to_string(dict_file())
+        .ok()
+        .and_then(|text| parse_local_dictionary(&text).ok())
+        .unwrap_or_default();
+    *cache = Some(entries);
+}
+
+fn normalize_dict_lang(raw: &str, line: usize) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() || value == "*" || value.eq_ignore_ascii_case("any") {
+        return Ok("*".into());
+    }
+    find_language(value)
+        .map(|lang| lang.code.to_string())
+        .ok_or_else(|| format!("line {line}: unknown language '{value}' (use * for any)"))
+}
+
+/// Split one CSV line, honouring double-quoted fields ("" escapes a quote).
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    fields.push(current);
+    fields
+        .into_iter()
+        .map(|f| f.trim().to_string())
+        .collect()
+}
+
+/// Parse a local dictionary. Each non-comment line is either
+/// `source<TAB>target` or `src_lang<TAB>tgt_lang<TAB>source<TAB>target`
+/// (commas are accepted as separators too). `*` means "any language".
+fn parse_local_dictionary(text: &str) -> Result<Vec<LocalEntry>, String> {
+    let mut entries = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<String> = if line.contains('\t') {
+            line.split('\t').map(|s| s.trim().to_string()).collect()
+        } else if line.contains(',') {
+            split_csv_line(line)
+        } else {
+            return Err(format!(
+                "line {}: expected tab- or comma-separated columns",
+                idx + 1
+            ));
+        };
+        let entry = match cols.len() {
+            2 => LocalEntry {
+                src_lang: "*".into(),
+                tgt_lang: "*".into(),
+                source: cols[0].clone(),
+                target: cols[1].clone(),
+            },
+            4 => LocalEntry {
+                src_lang: normalize_dict_lang(&cols[0], idx + 1)?,
+                tgt_lang: normalize_dict_lang(&cols[1], idx + 1)?,
+                source: cols[2].clone(),
+                target: cols[3].clone(),
+            },
+            n => {
+                return Err(format!(
+                    "line {}: expected 2 or 4 columns, found {n}",
+                    idx + 1
+                ));
+            }
+        };
+        if entry.source.is_empty() || entry.target.is_empty() {
+            return Err(format!(
+                "line {}: source and target must not be empty",
+                idx + 1
+            ));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn import_dictionary(path: &Path) -> Result<usize, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let entries = parse_local_dictionary(&text)?;
+    if entries.is_empty() {
+        return Err("the dictionary contains no entries".into());
+    }
+
+    let mut out = String::from(
+        "# ecapp local dictionary (experimental)\n\
+         # src_lang<TAB>tgt_lang<TAB>source<TAB>target   (* = any language)\n",
+    );
+    for entry in &entries {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            entry.src_lang, entry.tgt_lang, entry.source, entry.target
+        ));
+    }
+
+    let dir = config_path();
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create '{}': {e}", dir.display()))?;
+    let file = dict_file();
+    fs::write(&file, out).map_err(|e| format!("cannot write '{}': {e}", file.display()))?;
+
+    if let Ok(mut cache) = local_dict().lock() {
+        *cache = None;
+    }
+    Ok(entries.len())
+}
+
+/// First matching local entry for an exact (case-insensitive) input.
+/// Language-specific entries win over `*` entries.
+fn lookup_in_local(entries: &[LocalEntry], src: &str, tgt: &str, text: &str) -> Option<String> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let lang_ok = |entry_lang: &str, lang: &str| {
+        entry_lang == "*"
+            || entry_lang.eq_ignore_ascii_case(lang)
+            || lang.eq_ignore_ascii_case("auto")
+    };
+    let mut wildcard = None;
+    for entry in entries {
+        if !lang_ok(&entry.src_lang, src) || !lang_ok(&entry.tgt_lang, tgt) {
+            continue;
+        }
+        if entry.source.trim().to_lowercase() != needle {
+            continue;
+        }
+        if entry.src_lang == "*" && entry.tgt_lang == "*" {
+            wildcard.get_or_insert_with(|| entry.target.clone());
+        } else {
+            return Some(entry.target.clone());
+        }
+    }
+    wildcard
+}
+
+fn local_lookup(src: &str, tgt: &str, text: &str) -> Option<String> {
+    ensure_local_dict_loaded();
+    let guard = local_dict().lock().ok()?;
+    lookup_in_local(guard.as_ref()?, src, tgt, text)
+}
+
+fn dictionary_count() -> usize {
+    ensure_local_dict_loaded();
+    local_dict()
+        .lock()
+        .map(|guard| guard.as_ref().map(Vec::len).unwrap_or(0))
+        .unwrap_or(0)
+}
+
 // ── bilingual dictionary (two-way) ───────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1135,6 +1595,15 @@ fn handle_dict_word(
         WordSide::Source => (src, tgt),
         WordSide::Target => (tgt, src),
     };
+
+    if let Some(local) = local_lookup(dict_lang, other_lang, word) {
+        println!("\x1b[1m{word}\x1b[0m");
+        println!(
+            "  \x1b[1;32m{local}\x1b[0m  \x1b[90m[{other_lang}, local dictionary]\x1b[0m"
+        );
+        println!();
+        return;
+    }
 
     let mut dict_hit = false;
     match lookup_dictionary(agent, word, dict_lang) {
@@ -2065,6 +2534,8 @@ struct CliTranslate {
 enum CliAction {
     Help,
     Set { source: String, target: String },
+    ChangeApi { target: Option<String> },
+    ImportDict { path: PathBuf },
     Translate(CliTranslate),
     Interactive,
 }
@@ -2175,6 +2646,8 @@ fn parse_cli(args: &[String]) -> CliAction {
     let mut performe = false;
     let mut output: Option<String> = None;
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut change_api: Option<Option<String>> = None;
+    let mut import_dict: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -2237,6 +2710,33 @@ fn parse_cli(args: &[String]) -> CliAction {
                 }
             },
             "-p" | "--performe" | "--per" => performe = true,
+            "-capi" | "--changeAPI" | "--changeapi" | "--change-api" => {
+                let value = if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    Some(args[i].clone())
+                } else {
+                    None
+                };
+                change_api = Some(value);
+            }
+            s if s.starts_with("--changeAPI=") || s.starts_with("--changeapi=") => {
+                change_api = Some(Some(s[12..].to_string()));
+            }
+            s if s.starts_with("--change-api=") => {
+                change_api = Some(Some(s[13..].to_string()));
+            }
+            "--import-dict" | "-idict" | "--dict-import" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    import_dict = Some(expand_tilde(&args[i]));
+                } else {
+                    eprintln!("Usage: ecapp --import-dict <file>");
+                    std::process::exit(1);
+                }
+            }
+            s if s.starts_with("--import-dict=") => {
+                import_dict = Some(expand_tilde(&s[14..]));
+            }
             "-f" | "--file" => {
                 translate = true;
                 let start = files.len();
@@ -2275,6 +2775,14 @@ fn parse_cli(args: &[String]) -> CliAction {
             }
         }
         i += 1;
+    }
+
+    if let Some(target) = change_api {
+        return CliAction::ChangeApi { target };
+    }
+
+    if let Some(path) = import_dict {
+        return CliAction::ImportDict { path };
     }
 
     if let Some((s, t)) = set {
@@ -2670,6 +3178,36 @@ fn main() {
             println!("Default languages set: {source} -> {target}");
             return;
         }
+        CliAction::ChangeApi { target } => {
+            let mut cfg = config.clone();
+            match target {
+                Some(value) => match apply_api_change(&mut cfg, &value) {
+                    Ok(message) => println!("{message}"),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => show_api_config(&cfg),
+            }
+            return;
+        }
+        CliAction::ImportDict { path } => {
+            match import_dictionary(&path) {
+                Ok(count) => {
+                    println!(
+                        "Imported {count} dictionary entries (experimental) into {}",
+                        dict_file().display()
+                    );
+                    println!("Entries are used for exact inputs and in tra-dir mode.");
+                }
+                Err(e) => {
+                    eprintln!("Dictionary import failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         CliAction::Translate(req) => {
             run_cli_translate(&agent, &config, req);
             return;
@@ -2933,11 +3471,12 @@ fn main() {
             }
 
             AppMode::ApiConfig => {
-                let backend_name = BACKENDS
-                    .iter()
-                    .find(|(id, _, _)| *id == config.backend)
-                    .map(|(_, name, _)| *name)
-                    .unwrap_or("Unknown");
+                let current = effective_backend(&config);
+                let backend_name = if current == "custom" {
+                    "custom".to_string()
+                } else {
+                    backend_name(&current).to_string()
+                };
 
                 let prompt = format!("[api: {backend_name}]# ");
                 let Ok(line) = rl.readline(&prompt) else {
@@ -2955,26 +3494,16 @@ fn main() {
                         println!();
                         println!("  API Configuration Commands:");
                         println!("    show                 Display current config");
-                        println!("    set <backend>        Switch backend (mymemory / gtx / lingva / google / deepl)");
+                        println!("    set <backend|url>    Switch API or set a custom URL");
+                        println!("    dict <file>          Import a local dictionary (experimental)");
+                        println!("    dict                 Show local dictionary status");
                         println!("    key <api-key>        Set API key for current backend");
                         println!("    key                  Clear the API key");
                         println!("    exit                 Return to main mode");
                         println!();
                     }
                     "show" => {
-                        println!();
-                        println!("  Current backend: {}", config.backend);
-                        for (id, name, desc) in BACKENDS {
-                            let active = if *id == config.backend { " [ACTIVE]" } else { "" };
-                            println!("    {id:<12} {name:<20} {desc}{active}");
-                        }
-                        if config.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
-                            let masked = mask_key(config.api_key.as_deref().unwrap_or(""));
-                            println!("  API key: {masked}");
-                        } else {
-                            println!("  API key: (not set)");
-                        }
-                        println!();
+                        show_api_config(&config);
                     }
                     "exit" => {
                         save_config(&config);
@@ -2982,20 +3511,28 @@ fn main() {
                         println!("API config saved.");
                     }
                     _ if line.starts_with("set ") => {
-                        let backend = line.strip_prefix("set ").unwrap().trim().to_lowercase();
-                        if BACKENDS.iter().any(|(id, _, _)| *id == backend) {
-                            config.backend = backend;
-                            config.api_key = None;
-                            save_config(&config);
-                            let name = BACKENDS
-                                .iter()
-                                .find(|(id, _, _)| *id == config.backend)
-                                .map(|(_, name, _)| *name)
-                                .unwrap_or("");
-                            println!("Switched to {name}. Remember to set an API key with 'key'.");
-                        } else {
-                            println!("Unknown backend '{backend}'. Available: mymemory, gtx, lingva, google, deepl");
+                        let value = line.strip_prefix("set ").unwrap().trim();
+                        match apply_api_change(&mut config, value) {
+                            Ok(message) => println!("{message}"),
+                            Err(e) => println!("{e}"),
                         }
+                    }
+                    _ if line.starts_with("dict ") => {
+                        let path = expand_tilde(line.strip_prefix("dict ").unwrap().trim());
+                        match import_dictionary(&path) {
+                            Ok(count) => println!(
+                                "Imported {count} entries into {}.",
+                                dict_file().display()
+                            ),
+                            Err(e) => println!("Dictionary import failed: {e}"),
+                        }
+                    }
+                    "dict" => {
+                        println!(
+                            "  Local dictionary: {} ({} entries, experimental)",
+                            dict_file().display(),
+                            dictionary_count()
+                        );
                     }
                     _ if line.starts_with("key ") => {
                         let key = line.strip_prefix("key ").unwrap().trim();
@@ -3186,5 +3723,94 @@ mod tests {
             }
             _ => panic!("expected translate"),
         }
+    }
+
+    #[test]
+    fn cli_parses_api_and_dict_flags() {
+        let api: Vec<String> = ["-capi", "gtx"].iter().map(|s| s.to_string()).collect();
+        match parse_cli(&api) {
+            CliAction::ChangeApi { target } => assert_eq!(target.as_deref(), Some("gtx")),
+            _ => panic!("expected change api"),
+        }
+
+        let url: Vec<String> = ["--changeAPI=https://lingva.example.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse_cli(&url) {
+            CliAction::ChangeApi { target } => {
+                assert_eq!(target.as_deref(), Some("https://lingva.example.com"));
+            }
+            _ => panic!("expected change api"),
+        }
+
+        let dict: Vec<String> = ["--import-dict", "words.tsv"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse_cli(&dict) {
+            CliAction::ImportDict { path } => assert_eq!(path, PathBuf::from("words.tsv")),
+            _ => panic!("expected import dict"),
+        }
+    }
+
+    #[test]
+    fn local_dictionary_parsing_and_lookup() {
+        let text = "\
+# comment
+hello\t哈喽
+en_us\tzh_cn\thello\t你好
+\"thank you, friend\",谢谢朋友
+";
+        let entries = parse_local_dictionary(text).unwrap();
+        assert_eq!(entries.len(), 3);
+        // Language-specific entries win over wildcard entries.
+        assert_eq!(
+            lookup_in_local(&entries, "en_us", "zh_cn", "Hello"),
+            Some("你好".into())
+        );
+        assert_eq!(
+            lookup_in_local(&entries, "fr_fr", "zh_cn", "hello"),
+            Some("哈喽".into())
+        );
+        assert_eq!(
+            lookup_in_local(&entries, "en_us", "zh_cn", "thank you, friend"),
+            Some("谢谢朋友".into())
+        );
+        assert_eq!(lookup_in_local(&entries, "en_us", "zh_cn", "unknown"), None);
+    }
+
+    #[test]
+    fn local_dictionary_rejects_bad_input() {
+        assert!(parse_local_dictionary("a\tb\tc").is_err());
+        assert!(parse_local_dictionary("xx_xx\tzh_cn\thello\t你好").is_err());
+        assert!(parse_local_dictionary("hello 你好").is_err());
+    }
+
+    #[test]
+    fn custom_url_base_and_template() {
+        let cfg = ApiConfig {
+            backend: "custom".into(),
+            custom_url: Some("https://lingva.example.com/".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_custom_url(&cfg, "hello world", "en_us", "zh_cn").unwrap(),
+            "https://lingva.example.com/api/v1/en/zh/hello%20world"
+        );
+
+        let cfg = ApiConfig {
+            custom_url: Some("https://api.example.com/t?sl={sl}&tl={tl}&q={text}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_custom_url(&cfg, "hi", "auto", "ja_jp").unwrap(),
+            "https://api.example.com/t?sl=auto&tl=ja&q=hi"
+        );
+        // Templates receive the normal API code, not Lingva's base Chinese code.
+        assert_eq!(
+            build_custom_url(&cfg, "hi", "en_us", "zh_cn").unwrap(),
+            "https://api.example.com/t?sl=en&tl=zh-CN&q=hi"
+        );
     }
 }

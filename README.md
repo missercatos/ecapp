@@ -33,8 +33,13 @@ Translation, and DeepL.
   you type, delete, or edit.
 - **Automatic source failover** — multiple translation sources are built in;
   when the active one fails (down, quota, network), ecapp automatically
-  switches to another available source and remembers the dead one for the rest
-  of the run.
+  switches to another available source and **locks onto it** until it fails
+  too, then rotates again. The working source is remembered across runs.
+- **Manual API switching** — `ecapp -capi gtx` (or `--changeAPI`) switches
+  immediately; a custom Lingva-compatible URL can be used as a backend.
+- **Local dictionary (experimental)** — import a TSV/CSV glossary with
+  `ecapp --import-dict words.tsv`; local entries override exact inputs and are
+  used by `tra-dir` dictionary mode.
 
 ---
 
@@ -87,6 +92,9 @@ ecapp -s <src> <tgt>                     Set default languages
 ecapp --set=<src>-><tgt>                 Same
 ecapp -p, --performe, --per              Real-time translation mode
 ecapp -t <src> <tgt> -p                  Performe mode with explicit languages
+ecapp -capi [id|url]                     Show or switch the translation API
+ecapp --changeAPI <id|url>               Same, e.g. gtx / lingva / https://...
+ecapp --import-dict <file>               Import a local dictionary (experimental)
 ```
 
 `-f` / `--file` is the automatic file translator: it uses your default
@@ -250,20 +258,59 @@ internal `set` command, or pass explicit languages with `ecapp -t zh_cn en_us -p
 | `lingva`   | no         | Lingva Translate (free Google frontend)      |
 | `google`   | yes        | Google Cloud Translation                     |
 | `deepl`    | yes        | DeepL (free tier: 500k chars/month)          |
+| `custom`   | no         | your own Lingva-compatible endpoint / template |
 
-Choose the active source with `ecapp` → `api` → `set <backend>`, or let the
-default (`mymemory`) stand.
-
-**Automatic failover:** whenever the active source fails — it is unreachable,
-out of quota, or returns an error — ecapp immediately retries with the next
-available source. Key-less sources are always available; keyed sources only
-join the chain once an API key is set. A source that failed during the current
-run is skipped afterwards, so long files and performe mode do not keep hitting
-a dead source. Switch notices are printed to stderr, keeping stdout clean for
-pipes and redirection.
+**Automatic failover, with a lock-in:** whenever the active source fails — it is
+unreachable, out of quota, or returns an error — ecapp immediately retries the
+next available source. The first one that works is **locked**: it is used for
+the rest of the run and saved as the preferred backend, so later runs start
+there directly. Only when it fails too does ecapp rotate again. Key-less
+sources are always available; keyed sources join the chain once an API key is
+set. A source that failed during the run is skipped afterwards, so long files
+and performe mode do not keep hitting a dead source. Switch notices are printed
+to stderr, keeping stdout clean for pipes and redirection.
 
 Long inputs are chunked to fit the strictest limit of every source in the
 chain, so falling back never exceeds a backend's per-request limit.
+
+### Switching the API manually
+
+```sh
+ecapp -capi                    # show the current backend and the list
+ecapp -capi gtx                # switch to the free Google endpoint
+ecapp --changeAPI deepl        # long form
+ecapp -capi https://lingva.example.com   # custom endpoint
+```
+
+A custom URL is treated as a Lingva-compatible base: ecapp requests
+`<url>/api/v1/<src>/<tgt>/<text>` and reads the `translation` JSON field. If the
+URL contains `{sl}`, `{tl}` or `{text}`, it is used as a template instead:
+
+```sh
+ecapp -capi 'https://api.example.com/t?sl={sl}&tl={tl}&q={text}'
+```
+
+You can also manage this interactively: `ecapp` → `api` → `set <backend|url>`.
+
+### Local dictionary (experimental)
+
+```sh
+ecapp --import-dict words.tsv
+```
+
+The file is copied to `~/.config/ecapp/dictionary.tsv`. Supported lines:
+
+```text
+# source and target, any language
+hello	你好
+# src_lang, tgt_lang, source, target ("*" = any language)
+en_us	zh_cn	good morning	早上好
+```
+
+Tabs or commas are accepted (quote CSV fields containing commas). Language-
+specific entries win over `*` entries. Imported entries override exact inputs
+before any network request and are used for word lookups in `tra-dir` mode.
+Import from a running session with `api` → `dict <file>`.
 
 ---
 

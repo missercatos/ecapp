@@ -39,14 +39,17 @@ tar czf "dist/$TARBALL" -C dist ecapp
 SHA256=$(sha256sum "dist/$TARBALL" | cut -d' ' -f1)
 echo "  local SHA256: $SHA256 (provisional, CI will publish a different hash)"
 
-echo "=== Updating PKGBUILD (provisional hash) ==="
+echo "=== Updating PKGBUILD (provisional hash) and .SRCINFO ==="
 
 sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
 sed -i "s/^sha256sums=('.*')/sha256sums=('$SHA256')/" PKGBUILD
+if command -v makepkg &>/dev/null; then
+  makepkg --printsrcinfo > .SRCINFO
+fi
 
 echo "=== Git commit & tag & push (GitHub) ==="
 
-git add PKGBUILD
+git add PKGBUILD .SRCINFO
 git commit -m "release v${VERSION}"
 git tag "$TAG"
 git push "$REMOTE" HEAD

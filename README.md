@@ -18,6 +18,10 @@ Translation, and DeepL.
 - **File translation** — `ecapp -t en_us zh_cn @english.txt` translates any text
   file (`.log`, `.md`, `.txt`, …) and prints it; add `-o out.txt` to write it to
   a file.
+- **Fully automatic file / batch translation** — `ecapp -f english.txt` writes
+  the result next to the original as `english(1).txt` (no `-o` needed). Several
+  files can be translated in one go with `-f "{a.txt,b.txt}"` and
+  `-o "{}.zh.txt"`; `~` in paths is expanded.
 - **Command output translation** — pipe any command into ecapp:
   `man zip | ecapp -t en_us zh_cn`, `journalctl | ecapp -t auto zh_cn`, etc.
 - **Default languages** — `ecapp -s en_us zh_cn` remembers your languages, so
@@ -39,12 +43,18 @@ Translation, and DeepL.
 ### Arch Linux (AUR)
 
 ```sh
-# prebuilt binary
+# prebuilt binary (ecapp and ecapp-bin are the same package)
 yay -S ecapp-bin
 
 # build from git
 yay -S ecapp-git
 ```
+
+### Windows
+
+Download `ecapp-v<version>-x86_64-windows.zip` from the
+[releases page](https://github.com/missercatos/ecapp/releases/latest), unzip it,
+and run `ecapp.exe` (PowerShell or Windows Terminal recommended).
 
 ### From source
 
@@ -67,14 +77,29 @@ ecapp -t <src> <tgt> <text>              Translate text
 ecapp --tra=<src>-><tgt> <text>          Same as -t (also --translation=...)
 ecapp --tra <src> <tgt> <text>           Same (also --translation ...)
 ecapp -t <text>                          Translate using default languages
-ecapp -t <src> <tgt> @file               Translate a file (log/md/txt/...)
+ecapp -t <src> <tgt> @file               Translate a file (prints to stdout)
 ecapp -t <src> <tgt> @file -o out.txt    Write the result to a file
+ecapp -f, --file <file>                  Translate a file to <name>(1).<ext>
+ecapp -f <a> <b> -o "{}.zh.txt"          Batch translate several files
+ecapp -f "{a.txt,b.txt}" -o out/         Batch translate into a directory
 <cmd> | ecapp -t <src> <tgt>             Translate another command's output
 ecapp -s <src> <tgt>                     Set default languages
 ecapp --set=<src>-><tgt>                 Same
 ecapp -p, --performe, --per              Real-time translation mode
 ecapp -t <src> <tgt> -p                  Performe mode with explicit languages
 ```
+
+`-f` / `--file` is the automatic file translator: it uses your default
+languages (or explicit `-t` languages), expands a leading `~`, and writes a new
+file instead of printing to stdout.
+
+- Without `-o`, each input `name.ext` is written next to the original as
+  `name(1).ext` (`name(2).ext` if that already exists — nothing is overwritten).
+- `-o out.txt` writes a single file to that exact path.
+- `-o "{}.zh.txt"` replaces `{}` with the input file stem (without extension).
+- `-o outdir/` writes into a directory using the automatic `name(1).ext` names.
+- Several inputs can be passed as separate arguments (`-f a.txt b.txt`) or in
+  braces (`-f "{a.txt,b.txt}"`, also after shell brace expansion).
 
 ### Examples
 
@@ -95,6 +120,14 @@ ecapp -t en_us zh_cn @english.txt | grep hello
 
 # translate a file into a new file
 ecapp -t en_us zh_cn @english.txt -o chinese.txt
+
+# fully automatic: writes english(1).txt next to the original
+ecapp -t en_us zh_cn -f english.txt
+ecapp -f ~/notes/english.txt          # ~ is expanded
+
+# batch: each file gets its own output
+ecapp -f "{a.txt,b.txt}" -o "{}.zh.txt"     # a.zh.txt, b.zh.txt
+ecapp -f a.txt b.txt -o translated/         # translated/a(1).txt, ...
 
 # translate another command's screen output (man, cat, journalctl, ...)
 man zip | ecapp -t en_us zh_cn

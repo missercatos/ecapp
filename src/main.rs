@@ -11,7 +11,7 @@ use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 use ureq::Agent;
@@ -28,8 +28,14 @@ CLI Usage (one-shot, works without entering the interactive shell):
   ecapp --tra=<src>-><tgt> <text>          Same as -t (also --translation=...)
   ecapp --tra <src> <tgt> <text>           Same (also --translation ...)
   ecapp -t <text>                          Translate using default languages
-  ecapp -t <src> <tgt> @file               Translate a file (log/md/txt/...)
+  ecapp -t <src> <tgt> @file               Translate a file (prints to stdout)
   ecapp -t <src> <tgt> @file -o out.txt    Write the result to a file
+  ecapp -f, --file <file>                  Translate a file to <name>(1).<ext>
+  ecapp -f <a> <b> -o "{}.zh.txt"          Batch translate several files
+  ecapp -f "{a.txt,b.txt}" -o out/         Batch translate into a directory
+                                           -f accepts paths and expands a leading
+                                           ~; without -o each input is written
+                                           next to the original as name(1).ext
   <cmd> | ecapp -t <src> <tgt>             Translate another command's output
                                            e.g. man zip | ecapp -t en_us zh_cn
                                                 journalctl | ecapp -t auto zh_cn
@@ -2047,16 +2053,19 @@ enum AppMode {
 
 // ── CLI one-shot mode ─────────────────────────────────────────────────
 
+struct CliTranslate {
+    source: Option<String>,
+    target: Option<String>,
+    content: Option<String>,
+    output: Option<String>,
+    performe: bool,
+    files: Vec<PathBuf>,
+}
+
 enum CliAction {
     Help,
     Set { source: String, target: String },
-    Translate {
-        source: Option<String>,
-        target: Option<String>,
-        content: Option<String>,
-        output: Option<PathBuf>,
-        performe: bool,
-    },
+    Translate(CliTranslate),
     Interactive,
 }
 
@@ -2115,6 +2124,49 @@ fn resolve_t_langs(
     (None, None, Some(args.join(" ")))
 }
 
+/// Home directory, on Unix and Windows.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Expand a leading `~` or `~/` (also `~\` on Windows). Shells only expand
+/// an unquoted leading tilde, but file arguments are usually quoted, so do it
+/// here as well.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~"
+        && let Some(home) = home_dir()
+    {
+        return home;
+    }
+    for prefix in ["~/", "~\\"] {
+        if let Some(rest) = raw.strip_prefix(prefix)
+            && let Some(home) = home_dir()
+        {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Split a `-f/--file` value into file names. Supports a single path and the
+/// brace form `{a.txt,b.txt}` (quoted or already brace-expanded by the shell).
+fn parse_file_list(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    let items: Vec<&str> = if raw.len() >= 2 && raw.starts_with('{') && raw.ends_with('}') {
+        raw[1..raw.len() - 1].split(',').collect()
+    } else {
+        vec![raw]
+    };
+    items
+        .into_iter()
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_cli(args: &[String]) -> CliAction {
     let mut translate = false;
     let mut set: Option<(String, String)> = None;
@@ -2122,6 +2174,7 @@ fn parse_cli(args: &[String]) -> CliAction {
     let mut translate_args: Vec<String> = Vec::new();
     let mut performe = false;
     let mut output: Option<String> = None;
+    let mut files: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -2184,6 +2237,29 @@ fn parse_cli(args: &[String]) -> CliAction {
                 }
             },
             "-p" | "--performe" | "--per" => performe = true,
+            "-f" | "--file" => {
+                translate = true;
+                let start = files.len();
+                while i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    for name in parse_file_list(&args[i + 1]) {
+                        files.push(expand_tilde(&name));
+                    }
+                    i += 1;
+                }
+                if files.len() == start {
+                    eprintln!("Usage: ecapp -f <file> [...]");
+                    std::process::exit(1);
+                }
+            }
+            s if s.starts_with("--file=") => {
+                translate = true;
+                let parsed = parse_file_list(&s[7..]);
+                if parsed.is_empty() {
+                    eprintln!("Usage: ecapp --file=<file>");
+                    std::process::exit(1);
+                }
+                files.extend(parsed.iter().map(|p| expand_tilde(p)));
+            }
             "-o" => {
                 if i + 1 < args.len() {
                     output = Some(args[i + 1].clone());
@@ -2207,13 +2283,14 @@ fn parse_cli(args: &[String]) -> CliAction {
 
     if translate || performe {
         let (source, target, content) = resolve_t_langs(&translate_args, translate_langs);
-        return CliAction::Translate {
+        return CliAction::Translate(CliTranslate {
             source,
             target,
             content,
-            output: output.map(PathBuf::from),
+            output,
             performe,
-        };
+            files,
+        });
     }
 
     CliAction::Interactive
@@ -2297,15 +2374,167 @@ fn translate_text_chunked(
     Ok(out)
 }
 
-fn run_cli_translate(
+/// Default output for a file: `<stem>(<n>)<ext>` next to the input (or in
+/// `dir` when given), picking the first free name so nothing is overwritten.
+fn default_output_path(input: &Path, dir: Option<&Path>) -> PathBuf {
+    let dir: PathBuf = dir
+        .map(Path::to_path_buf)
+        .or_else(|| input.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let ext = input.extension().map(|e| e.to_string_lossy().into_owned());
+    let mut n: u64 = 1;
+    loop {
+        let name = match &ext {
+            Some(ext) => format!("{stem}({n}).{ext}"),
+            None => format!("{stem}({n})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Work out the output path for one input file.
+///
+/// `-o` may contain `{}`, which is replaced with the input file stem, or name
+/// a directory. Without `-o` the result goes next to the input as
+/// `name(1).ext`.
+fn resolve_output_path(input: &Path, output: Option<&str>, multi: bool) -> Result<PathBuf, String> {
+    let Some(template) = output else {
+        return Ok(default_output_path(input, None));
+    };
+    if template.contains("{}") {
+        let stem = input
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let filled = template.replace("{}", &stem);
+        if filled.trim().is_empty() {
+            return Err("-o expands to an empty file name".into());
+        }
+        return Ok(expand_tilde(&filled));
+    }
+    let path = expand_tilde(template);
+    let is_dir = template.ends_with('/') || template.ends_with('\\') || path.is_dir();
+    if is_dir {
+        return Ok(default_output_path(input, Some(&path)));
+    }
+    if multi {
+        return Err("with multiple input files, -o must contain '{}' or name a directory".into());
+    }
+    Ok(path)
+}
+
+/// Translate one or more files, writing each result to its own output file.
+fn run_cli_translate_files(
     agent: &Agent,
     config: &ApiConfig,
-    source: Option<String>,
-    target: Option<String>,
-    content: Option<String>,
-    output: Option<PathBuf>,
-    performe: bool,
+    src: &str,
+    tgt: &str,
+    files: &[PathBuf],
+    output: Option<&str>,
 ) {
+    for file in files {
+        if !file.is_file() {
+            eprintln!("cannot read file '{}': not a regular file", file.display());
+            std::process::exit(1);
+        }
+    }
+
+    let multi = files.len() > 1;
+    let mut jobs: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(files.len());
+    for input in files {
+        match resolve_output_path(input, output, multi) {
+            Ok(out) => jobs.push((input.clone(), out)),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    for (i, (input, out)) in jobs.iter().enumerate() {
+        if out == input {
+            eprintln!("refusing to overwrite input file '{}'", input.display());
+            std::process::exit(1);
+        }
+        if jobs.iter().take(i).any(|(_, other)| other == out) {
+            eprintln!("two input files map to the same output '{}'", out.display());
+            std::process::exit(1);
+        }
+    }
+
+    let total = jobs.len();
+    let mut failed = 0usize;
+    for (i, (input, out)) in jobs.iter().enumerate() {
+        eprintln!(
+            "[{}/{}] {} -> {}",
+            i + 1,
+            total,
+            input.display(),
+            out.display()
+        );
+        let text = match fs::read_to_string(input) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  cannot read '{}': {e}", input.display());
+                failed += 1;
+                continue;
+            }
+        };
+        if text.trim().is_empty() {
+            eprintln!("  nothing to translate (empty file)");
+            failed += 1;
+            continue;
+        }
+        let translated = match translate_text_chunked(agent, config, &text, src, tgt) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  translation failed: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        if let Some(parent) = out.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!("  cannot create '{}': {e}", parent.display());
+            failed += 1;
+            continue;
+        }
+        if let Err(e) = fs::write(out, translated) {
+            eprintln!("  cannot write '{}': {e}", out.display());
+            failed += 1;
+        }
+    }
+
+    if failed > 0 {
+        eprintln!("{failed}/{total} file(s) failed.");
+        std::process::exit(1);
+    }
+    if total == 1 {
+        eprintln!("Translation written to {}.", jobs[0].1.display());
+    } else {
+        eprintln!("Translated {total} files.");
+    }
+}
+
+fn run_cli_translate(agent: &Agent, config: &ApiConfig, req: CliTranslate) {
+    let CliTranslate {
+        source,
+        target,
+        content,
+        output,
+        performe,
+        files,
+    } = req;
     let (src, tgt) = match (source, target) {
         (Some(s), Some(t)) => (s, t),
         (Some(s), None) => {
@@ -2331,6 +2560,19 @@ fn run_cli_translate(
     if let Err(e) = validate_lang_pair(&src, &tgt) {
         eprintln!("{e}");
         std::process::exit(1);
+    }
+
+    if !files.is_empty() {
+        if performe {
+            eprintln!("-p/--performe cannot be combined with -f/--file.");
+            std::process::exit(1);
+        }
+        if content.is_some() {
+            eprintln!("cannot combine text with -f/--file.");
+            std::process::exit(1);
+        }
+        run_cli_translate_files(agent, config, &src, &tgt, &files, output.as_deref());
+        return;
     }
 
     if performe && content.is_none() && io::stdin().is_terminal() {
@@ -2377,6 +2619,7 @@ fn run_cli_translate(
     match translated {
         Ok(translated) => {
             if let Some(out) = output {
+                let out = expand_tilde(&out);
                 match fs::write(&out, &translated) {
                     Ok(()) => eprintln!("Translation written to {}.", out.display()),
                     Err(e) => {
@@ -2427,14 +2670,8 @@ fn main() {
             println!("Default languages set: {source} -> {target}");
             return;
         }
-        CliAction::Translate {
-            source,
-            target,
-            content,
-            output,
-            performe,
-        } => {
-            run_cli_translate(&agent, &config, source, target, content, output, performe);
+        CliAction::Translate(req) => {
+            run_cli_translate(&agent, &config, req);
             return;
         }
         CliAction::Interactive => {}
@@ -2888,5 +3125,66 @@ mod tests {
         let chain = translation_chain(&cfg);
         assert!(!chain.iter().any(|b| b == "mymemory"));
         clear_dead_backends();
+    }
+
+    #[test]
+    fn file_list_parsing() {
+        assert_eq!(parse_file_list("a.txt"), vec!["a.txt"]);
+        assert_eq!(parse_file_list("{a.txt,b.txt}"), vec!["a.txt", "b.txt"]);
+        assert_eq!(
+            parse_file_list("{ \"a.txt\" , 'b c.txt' }"),
+            vec!["a.txt", "b c.txt"]
+        );
+        assert!(parse_file_list("{}").is_empty());
+        // A comma only separates files inside braces.
+        assert_eq!(parse_file_list("a,b.txt"), vec!["a,b.txt"]);
+    }
+
+    #[test]
+    fn default_output_adds_counter() {
+        let dir = std::env::temp_dir().join(format!("ecapp-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("1.txt");
+        fs::write(&input, "x").unwrap();
+        assert_eq!(default_output_path(&input, None), dir.join("1(1).txt"));
+        fs::write(dir.join("1(1).txt"), "x").unwrap();
+        assert_eq!(default_output_path(&input, None), dir.join("1(2).txt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_placeholders_and_directories() {
+        let input = Path::new("/tmp/1.txt");
+        assert_eq!(
+            resolve_output_path(input, Some("{}.zh.txt"), false).unwrap(),
+            PathBuf::from("1.zh.txt")
+        );
+        assert!(resolve_output_path(input, Some("out.txt"), true).is_err());
+
+        let dir = std::env::temp_dir().join(format!("ecapp-out-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = format!("{}/", dir.display());
+        assert_eq!(
+            resolve_output_path(input, Some(&target), true).unwrap(),
+            dir.join("1(1).txt")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_parses_file_flag() {
+        let args: Vec<String> = ["-f", "{a.txt,b.txt}", "-o", "{}.zh.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse_cli(&args) {
+            CliAction::Translate(req) => {
+                assert_eq!(req.files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+                assert_eq!(req.output.as_deref(), Some("{}.zh.txt"));
+            }
+            _ => panic!("expected translate"),
+        }
     }
 }

@@ -85,3 +85,36 @@ jobs:
           VERSION: ${{ steps.package.outputs.version }}
           SHA256: ${{ steps.package.outputs.sha256 }}
         run: bash .github/scripts/backfill-pkgbuild.sh
+
+  windows:
+    needs: release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: build
+        env:
+          # Self-contained .exe, no Visual C++ redistributable needed.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked
+
+      - name: package
+        id: package
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart('v')
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\ecapp.exe dist\ecapp.exe
+          $zip = "ecapp-v$version-x86_64-windows.zip"
+          Compress-Archive -Path dist\ecapp.exe -DestinationPath "dist\$zip"
+          "tarball=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release upload "$env:GITHUB_REF_NAME" "dist\${{ steps.package.outputs.tarball }}" --clobber
